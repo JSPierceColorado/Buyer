@@ -1,226 +1,344 @@
-"""V2 buyer bot: once daily at noon America/Denver while Railway stays online.
+"""V2 live/paper BUYER: 12:00 America/Denver every NYSE trading weekday.
 
-Read only: does not write to Google Sheets or modify score formulas in column G.
+Reads original V2 Screener!G, requiring a same-day verified 9AM scan marker.
+For each score >=95: buy 2% of remaining usable CASH if unheld, or $5 if
+already held long. Never use margin buying power, leverage, shorts or options.
+One deterministic broker order ID per symbol/day; no blind submission retries.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 import os
 import re
-import time
-from dataclasses import dataclass
-from datetime import datetime, time as clock_time, timedelta
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
-DENVER = ZoneInfo("America/Denver")
-SHEET_ID = "14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ"
-LOG = logging.getLogger("v2-buyer")
+DENVER=ZoneInfo("America/Denver")
+NEW_YORK=ZoneInfo("America/New_York")
+SHEET_ID="14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ"
+LOG=logging.getLogger("v2-buyer")
+CENT=Decimal("0.01")
+SCORE_MIN=Decimal("95")
+MIN_ORDER=Decimal("1.00")
+ADD_DOLLARS=Decimal("5.00")
+SYMBOL_RE=re.compile(r"[A-Z][A-Z0-9.\-]{0,10}")
 
 
 @dataclass(frozen=True)
 class Settings:
-    alpaca_key: str
-    alpaca_secret: str
-    google_credentials_json: str
-    sheet_id: str
-    sheet_tab: str
-    paper: bool
-    dry_run: bool
-    threshold: Decimal
-    fraction: Decimal
+    alpaca_key:str
+    alpaca_secret:str
+    google_credentials_json:str
+    sheet_id:str
+    paper:bool
+    dry_run:bool
+    threshold:Decimal
+    fraction:Decimal
+    addition:Decimal
 
 
-def flag(name: str, default: bool) -> bool:
-    value = os.getenv(name, str(default)).lower().strip()
-    if value not in {"true", "false", "1", "0"}:
-        raise ValueError(f"{name} must be true or false")
-    return value in {"true", "1"}
+def flag(name:str,default:bool)->bool:
+    value=os.getenv(name,str(default)).lower().strip()
+    if value not in ("true","false","1","0"):
+        raise ValueError(name+" must be a boolean")
+    return value in ("true","1")
 
 
-def settings_from_env() -> Settings:
-    settings = Settings(
-        alpaca_key=os.getenv("APCA_API_KEY_ID", "").strip(),
-        alpaca_secret=os.getenv("APCA_API_SECRET_KEY", "").strip(),
-        google_credentials_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip(),
-        sheet_id=os.getenv("GOOGLE_SPREADSHEET_ID", SHEET_ID).strip(),
-        sheet_tab=os.getenv("GOOGLE_SHEET_TAB", "Screener").strip(),
-        paper=flag("ALPACA_PAPER", True),
-        dry_run=flag("DRY_RUN", True),
-        threshold=Decimal(os.getenv("MINIMUM_SCORE", "95")),
-        fraction=Decimal(os.getenv("BUY_FRACTION", "0.02")),
+def money(value)->Decimal:
+    if value is None or value=="":
+        raise ValueError("Missing broker cash or non-margin buying-power field")
+    try:
+        d=Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError("Invalid cash figure") from None
+    if not d.is_finite():
+        raise ValueError("Nonfinite cash figure")
+    return max(Decimal(0),d)
+
+
+def settings_from_env()->Settings:
+    s=Settings(
+        alpaca_key=os.getenv("APCA_API_KEY_ID","").strip(),
+        alpaca_secret=os.getenv("APCA_API_SECRET_KEY","").strip(),
+        google_credentials_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON","").strip(),
+        sheet_id=os.getenv("GOOGLE_SPREADSHEET_ID",SHEET_ID).strip(),
+        paper=flag("ALPACA_PAPER",True),
+        dry_run=flag("DRY_RUN",True),
+        threshold=money(os.getenv("MINIMUM_SCORE","95")),
+        fraction=money(os.getenv("BUY_FRACTION","0.02")),
+        addition=money(os.getenv("HELD_ADDITION_USD","5.00"))
     )
-    if not all([settings.alpaca_key, settings.alpaca_secret, settings.google_credentials_json]):
-        raise ValueError("Missing Alpaca keys or GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not settings.threshold.is_finite() or not 0 <= settings.threshold <= 100:
-        raise ValueError("MINIMUM_SCORE must be between 0 and 100")
-    if not settings.fraction.is_finite() or not 0 < settings.fraction <= Decimal("0.02"):
-        raise ValueError("BUY_FRACTION must be > 0 and <= 0.02")
-    if not settings.paper and not settings.dry_run and os.getenv("LIVE_TRADING_ACK") != "I_ACCEPT_LIVE_MARGIN_RISK":
-        raise ValueError("Live orders need LIVE_TRADING_ACK=I_ACCEPT_LIVE_MARGIN_RISK")
-    return settings
+    if not all((s.alpaca_key,s.alpaca_secret,s.google_credentials_json,s.sheet_id)):
+        raise ValueError("Missing broker or Sheet credentials")
+    if not SCORE_MIN<=s.threshold<=100:
+        raise ValueError("Score threshold must be between 95 and 100")
+    if not 0<s.fraction<=Decimal(".02"):
+        raise ValueError("Cash fraction must be 0-2%")
+    if s.addition!=ADD_DOLLARS:
+        raise ValueError("Held addition must be exactly $5")
+    if not s.paper and not s.dry_run:
+        if os.getenv("LIVE_TRADING_ACK")!="I_ACCEPT_REAL_MONEY_BUYS":
+            raise ValueError("Explicit LIVE_TRADING_ACK required for actual real-money orders")
+    return s
 
 
-def next_noon(now: datetime) -> datetime:
-    """Next weekday at 12:00 in Denver, adjusting automatically for DST."""
-    local_now = now.astimezone(DENVER)
+def next_noon(now:datetime)->datetime:
+    local=now.astimezone(DENVER)
     for days in range(8):
-        day = local_now.date() + timedelta(days=days)
-        if day.weekday() >= 5:
+        day=local.date()+timedelta(days=days)
+        if day.weekday()>=5:
             continue
-        target = datetime.combine(day, clock_time(12, 0), tzinfo=DENVER)
-        if target > local_now:
+        target=datetime(day.year,day.month,day.day,12,0,tzinfo=DENVER)
+        if target>local:
             return target
-    raise RuntimeError("Could not find next weekday")
+    raise RuntimeError("Could not determine weekday noon")
 
 
-def symbol_key(value: object) -> str:
-    return str(value or "").upper().strip().replace("/", ".")
+def normalize_symbol(value)->str:
+    text=str(value or "").strip().upper().replace("/","")
+    if not SYMBOL_RE.fullmatch(text):
+        raise ValueError("Invalid stock ticker")
+    return text
 
 
-def read_signals(sheets, settings: Settings) -> list[tuple[str, Decimal]]:
-    """Read A (ticker) and G (score); ignore other indicators and unused rows."""
-    tab = "'" + settings.sheet_tab.replace("'", "''") + "'"
-    response = sheets.spreadsheets().values().get(
-        spreadsheetId=settings.sheet_id,
-        range=f"{tab}!A1:G500",
-        valueRenderOption="UNFORMATTED_VALUE",
-    ).execute()
-    rows = response.get("values", [])
-    if not rows or len(rows[0]) < 7 or symbol_key(rows[0][0]) != "SYMBOL" or symbol_key(rows[0][6]) != "SCORE":
-        raise ValueError("Expected column A header 'symbol' and column G header 'score'")
-    qualified: dict[str, Decimal] = {}
+def verified_screener_signals(sheets, s:Settings, now:datetime)->list[tuple[str,Decimal]]:
+    """Read a single A:J values snapshot; fail closed if 9AM scan not current."""
+    response=sheets.spreadsheets().values().get(
+        spreadsheetId=s.sheet_id,range="'Screener'!A1:J150",
+        valueRenderOption="UNFORMATTED_VALUE").execute(num_retries=3)
+    rows=response.get("values",[])
+    if not rows or len(rows[0])<10 or rows[0][:7]!=[
+            "symbol","close","sma_200","sma_50","pos_52w","dollar_vol_m","score"]:
+        raise RuntimeError("V2_SCREENER_SCHEMA_MISMATCH")
+    if rows[0][8:]!=["last_scan_utc","completed_session_date"]:
+        raise RuntimeError("V2_SCREENER_NO_VERIFIED_SCAN_STAMP")
+    if len(rows)<2 or len(rows[1])<10:
+        raise RuntimeError("V2_SCREENER_STAMP_EMPTY")
+    try:
+        scanned=datetime.fromisoformat(str(rows[1][8]).replace("Z","+00:00"))
+        asof=datetime.fromisoformat(str(rows[1][9])).date()
+    except ValueError:
+        raise RuntimeError("V2_SCREENER_STAMP_INVALID") from None
+    if scanned.tzinfo is None:
+        raise RuntimeError("V2_SCREENER_STAMP_NAIVE")
+    current=now.astimezone(DENVER)
+    age=(now.astimezone(timezone.utc)-scanned.astimezone(timezone.utc)).total_seconds()
+    if (scanned.astimezone(DENVER).date()!=current.date()
+        or age<0 or age>6*3600):
+        raise RuntimeError("V2_SCREENER_NOT_REFRESHED_TODAY")
+    current_ny=now.astimezone(NEW_YORK).date()
+    if not (asof<current_ny and 0<(current_ny-asof).days<=7):
+        raise RuntimeError("V2_SCREENER_COMPLETED_DATA_STALE")
+
+    candidates={}
+    valid=set()
     for row in rows[1:]:
-        if len(row) < 7 or not row[0] or row[6] in (None, ""):
-            continue
-        symbol = symbol_key(row[0])
-        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,11}", symbol):
-            LOG.warning("Skipping invalid symbol: %r", row[0])
+        if not row or not row[0]:
             continue
         try:
-            score = Decimal(str(row[6]))
-        except (InvalidOperation, ValueError):
+            sym=normalize_symbol(row[0])
+        except ValueError:
             continue
-        if score.is_finite() and settings.threshold <= score <= 100:
-            qualified[symbol] = max(score, qualified.get(symbol, Decimal("0")))
-    return sorted(qualified.items(), key=lambda item: (-item[1], item[0]))
+        if sym in valid:
+            raise RuntimeError("V2_SCREENER_DUPLICATE_SYMBOL")
+        if len(row)<7:
+            continue
+        try:
+            metrics=[Decimal(str(x)) for x in row[1:7]]
+        except (InvalidOperation,ValueError,TypeError):
+            continue
+        if not all(x.is_finite() for x in metrics):
+            continue
+        close,sma200,sma50,pos52,dollar_volume,score=metrics
+        if not (close>0 and sma200>0 and sma50>0 and 0<=pos52<=1
+                and dollar_volume>=0 and 0<=score<=100):
+            continue
+        valid.add(sym)
+        if score>=s.threshold:
+            candidates[sym]=score
+    if not 95<=len(valid)<=125:
+        raise RuntimeError("V2_SCREENER_UNIVERSE_INCOMPLETE")
+    ordered=sorted(candidates.items(),key=lambda x:(-x[1],x[0]))
+    LOG.info("V2_SCAN_VERIFIED date=%s completed_session=%s symbols=%d qualified=%d",
+             current.date(),asof,len(valid),len(ordered))
+    return ordered
 
 
-def size_from_buying_power(buying_power: object, fraction: Decimal) -> Decimal:
-    value = Decimal(str(buying_power))
-    if not value.is_finite() or value <= 0:
-        return Decimal("0")
-    return (value * fraction).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+def client_order_id(day:str,symbol:str)->str:
+    sym=normalize_symbol(symbol).replace(".","-")
+    return f"v2b-{day.replace('-','')}-{sym}"[:48]
 
 
-def client_order_id(day: str, symbol: str) -> str:
-    return f"v2sp100-{day.replace('-', '')}-{symbol.replace('.', '-')}"[:48]
-
-
-def order_already_attempted(trader, client_id: str) -> bool:
+def order_already_attempted(trader,client_id:str)->bool:
     from alpaca.common.exceptions import APIError
     try:
-        trader.get_order_by_client_id(client_id)
-        return True
+        return trader.get_order_by_client_id(client_id) is not None
     except APIError as exc:
-        if exc.status_code == 404:
+        if str(getattr(exc,"status_code",""))=="404":
             return False
         raise
 
 
-def held_and_pending(trader) -> tuple[set[str], set[str]]:
+def held_and_pending(trader):
     from alpaca.trading.enums import QueryOrderStatus
     from alpaca.trading.requests import GetOrdersRequest
-    held = {symbol_key(p.symbol) for p in trader.get_all_positions()}
-    orders = trader.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
-    if len(orders) >= 500:
-        raise RuntimeError("Too many pending orders to verify safely")
-    pending = {symbol_key(o.symbol) for o in orders}
-    return held, pending
+    positions=trader.get_all_positions()
+    if positions is None:
+        raise RuntimeError("PAPER_OR_LIVE_POSITIONS_NOT_VERIFIED")
+    held={}
+    for position in positions:
+        symbol=normalize_symbol(position.symbol)
+        qty=Decimal(str(position.qty))
+        if not qty.is_finite() or qty==0:
+            continue
+        held[symbol]=qty
+    orders=trader.get_orders(filter=GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,limit=500))
+    if orders is None or len(orders)>=500:
+        raise RuntimeError("OPEN_BROKER_ORDERS_UNVERIFIED")
+    pending={normalize_symbol(order.symbol) for order in orders}
+    return held,pending
 
 
-def buy_signals(trader, signals: list[tuple[str, Decimal]], settings: Settings, date: str) -> dict:
-    from alpaca.trading.enums import OrderSide, TimeInForce
+def available_cash(account)->Decimal:
+    if any(bool(getattr(account,k,False)) for k in (
+            "account_blocked","trading_blocked","trade_suspended_by_user")):
+        raise RuntimeError("BROKER_ACCOUNT_RESTRICTED")
+    status=str(getattr(account,"status",""))
+    if not status.upper().endswith("ACTIVE"):
+        raise RuntimeError("BROKER_ACCOUNT_NOT_ACTIVE")
+    # Important: do NOT use buying_power; it may be 2x/4x margin leverage.
+    cash=money(getattr(account,"cash",None))
+    nonmargin=money(getattr(account,"non_marginable_buying_power",None))
+    return min(cash,nonmargin)
+
+
+def cash_order_amount(remaining:Decimal,fraction:Decimal,held:bool)->Decimal:
+    if held:
+        return ADD_DOLLARS if remaining>=ADD_DOLLARS else Decimal(0)
+    amount=(remaining*fraction).quantize(CENT,rounding=ROUND_DOWN)
+    return amount if amount>=MIN_ORDER else Decimal(0)
+
+
+def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dict:
+    from alpaca.trading.enums import OrderSide,TimeInForce,AssetClass
     from alpaca.trading.requests import MarketOrderRequest
-
-    results = {"qualified": len(signals), "ordered": [], "dry_run": [], "skipped": []}
-    for symbol, score in signals:
-        try:
-            if not trader.get_clock().is_open:
-                LOG.warning("Market closed while processing; stopping")
-                break
-            held, pending = held_and_pending(trader)
-            cid = client_order_id(date, symbol)
-            if symbol in held or symbol in pending or order_already_attempted(trader, cid):
-                results["skipped"].append((symbol, "held, pending, or already attempted"))
-                continue
-            asset = trader.get_asset(symbol)
-            if not asset.tradable or not asset.fractionable:
-                results["skipped"].append((symbol, "not fractionable/tradable"))
-                continue
-            account = trader.get_account()
-            if any(getattr(account, key, False) for key in
-                   ("account_blocked", "trading_blocked", "trade_suspended_by_user")):
-                raise RuntimeError("Alpaca account restricted from trading")
-            amount = size_from_buying_power(account.buying_power, settings.fraction)
-            if amount < Decimal("1"):
-                results["skipped"].append((symbol, "buying power too low"))
-                continue
-            if settings.dry_run:
-                LOG.info("DRY RUN: %s score=%s buy=$%s", symbol, score, amount)
-                results["dry_run"].append((symbol, str(amount)))
-                continue
-            order = trader.submit_order(order_data=MarketOrderRequest(
-                symbol=symbol, notional=float(amount), side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY, client_order_id=cid,
-            ))
-            LOG.info("BUY %s score=%s amount=$%s order_id=%s", symbol, score, amount, order.id)
-            results["ordered"].append((symbol, str(amount), str(order.id)))
-        except Exception:
-            # Never blindly retry an ambiguous order submission.
-            LOG.exception("Order processing stopped at %s", symbol)
+    results={"qualified":len(signals),"submitted":[],"preview":[],"skipped":[]}
+    if not signals:return results
+    account=trader.get_account()
+    remaining=available_cash(account)
+    _,pending=held_and_pending(trader)
+    for symbol,score in signals:
+        if not trader.get_clock().is_open:
+            LOG.warning("MARKET_CLOSED_DURING_CYCLE; stopping")
             break
+        # Every symbol must pass fresh broker checks, not assumptions from a sheet.
+        held,current_pending=held_and_pending(trader)
+        if symbol in pending or symbol in current_pending:
+            results["skipped"].append((symbol,"OPEN_ORDER"))
+            continue
+        if symbol in held and held[symbol]<0:
+            results["skipped"].append((symbol,"SHORT_POSITION_NOT_ELIGIBLE"))
+            continue
+        account=trader.get_account()
+        remaining=min(remaining,available_cash(account))
+        if remaining<MIN_ORDER:
+            results["skipped"].append((symbol,"NO_CASH"))
+            break
+        asset=trader.get_asset(symbol)
+        if (not bool(getattr(asset,"tradable",False))
+            or not bool(getattr(asset,"fractionable",False))
+            or getattr(asset,"asset_class",None)!=AssetClass.US_EQUITY):
+            results["skipped"].append((symbol,"NOT_FRACTIONABLE_US_EQUITY"))
+            continue
+        cid=client_order_id(day,symbol)
+        if order_already_attempted(trader,cid):
+            results["skipped"].append((symbol,"BUY_ORDER_ALREADY_ATTEMPTED_TODAY"))
+            continue
+        held_long=symbol in held and held[symbol]>0
+        amount=cash_order_amount(remaining,s.fraction,held_long)
+        if amount<MIN_ORDER:
+            results["skipped"].append((symbol,"INSUFFICIENT_CASH_FOR_RULE"))
+            continue
+        if s.dry_run:
+            results["preview"].append((symbol,str(score),str(amount),
+                                       "ADD_HELD" if held_long else "NEW_ENTRY"))
+        else:
+            req=MarketOrderRequest(
+                symbol=symbol,notional=float(amount),side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,client_order_id=cid)
+            try:
+                broker_order=trader.submit_order(order_data=req)
+            except Exception:
+                # Order might have reached Alpaca. Stop; never retry ambiguous POST.
+                LOG.exception("BROKER_ORDER_UNCONFIRMED symbol=%s cid=%s; aborting",symbol,cid)
+                raise
+            results["submitted"].append((symbol,str(score),str(amount),
+                                        str(broker_order.id),
+                                        "ADD_HELD" if held_long else "NEW_ENTRY"))
+            LOG.warning("SUBMITTED_%s symbol=%s score=%s dollars=%s client_id=%s",
+                "LIVE" if not s.paper else "PAPER",symbol,score,amount,cid)
+        remaining-=amount  # Reserve locally even if Alpaca cash has not updated.
+    LOG.info("V2_BUY_CYCLE qualified=%s ordered=%d preview=%d skipped=%d mode=%s",
+             len(signals),len(results["submitted"]),len(results["preview"]),
+             len(results["skipped"]),"DRY_RUN" if s.dry_run else ("PAPER" if s.paper else "LIVE"))
     return results
 
 
-def run_cycle(sheets, trader, settings: Settings, now: datetime) -> dict:
-    if now.astimezone(DENVER).weekday() >= 5 or not trader.get_clock().is_open:
-        LOG.info("Market closed today, skipping")
-        return {"status": "market-closed"}
-    signals = read_signals(sheets, settings)
-    LOG.info("Noon check: %d stocks scored >= %s", len(signals), settings.threshold)
-    return buy_signals(trader, signals, settings, now.astimezone(DENVER).date().isoformat())
+def run_cycle(sheets,trader,s:Settings,now:datetime)->dict:
+    if now.astimezone(DENVER).weekday()>=5 or not trader.get_clock().is_open:
+        return {"status":"MARKET_CLOSED"}
+    signals=verified_screener_signals(sheets,s,now)
+    return buy_signals(trader,signals,s,now.astimezone(DENVER).date().isoformat())
 
 
-def main() -> None:
-    logging.basicConfig(level="INFO", format="%(asctime)s %(levelname)s %(message)s")
-    settings = settings_from_env()
+def clients(s:Settings):
     from alpaca.trading.client import TradingClient
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
+    credentials=service_account.Credentials.from_service_account_info(
+        json.loads(s.google_credentials_json),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    sheets=build("sheets","v4",credentials=credentials,cache_discovery=False)
+    trader=TradingClient(s.alpaca_key,s.alpaca_secret,paper=s.paper)
+    return sheets,trader
 
-    credential_info = json.loads(settings.google_credentials_json)
-    credentials = service_account.Credentials.from_service_account_info(
-        credential_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
-    sheets = build("sheets", "v4", credentials=credentials, cache_discovery=False)
-    trader = TradingClient(settings.alpaca_key, settings.alpaca_secret, paper=settings.paper)
-    LOG.info("Buyer running perpetually; daily at noon Denver; paper=%s dry_run=%s", settings.paper, settings.dry_run)
-    while True:
-        due = next_noon(datetime.now(DENVER))
-        LOG.info("Next cycle at %s", due.isoformat())
-        while True:
-            remaining = (due - datetime.now(DENVER)).total_seconds()
-            if remaining <= 0:
-                break
-            time.sleep(min(remaining, 60))
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-now",action="store_true",
+        help="ONE immediate read-only dry-run using the configured account and score Sheet")
+    args=parser.parse_args()
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL","INFO"),
+        format="%(asctime)s %(levelname)s %(message)s")
+    s=settings_from_env()
+    if args.check_now:
+        s=replace(s,dry_run=True)
+        sheets,trader=clients(s)
+        report=run_cycle(sheets,trader,s,datetime.now(DENVER))
+        LOG.info("MANUAL_BUYER_PREVIEW status=%s",report)
+        return
+    from apscheduler.schedulers.blocking import BlockingScheduler
+    scheduler=BlockingScheduler(timezone=DENVER,
+        job_defaults={"coalesce":True,"max_instances":1,"misfire_grace_time":1800})
+    def scheduled():
         try:
-            LOG.info("Starting scheduled buyer cycle")
-            report = run_cycle(sheets, trader, settings, datetime.now(DENVER))
-            LOG.info("Cycle finished: %s", report)
-        except Exception:
-            LOG.exception("Cycle failed; next attempt will be at the next scheduled noon")
+            sheets,trader=clients(s)
+            report=run_cycle(sheets,trader,s,datetime.now(DENVER))
+            LOG.info("DAILY_NOON_BUYER_COMPLETED report=%s",report)
+        except Exception as exc:
+            LOG.error("DAILY_NOON_BUYER_FAILED type=%s",type(exc).__name__)
+    scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
+        hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
+    LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
+             "new_entry=2pct_remaining_cash existing_long_add=$5",
+             "PAPER" if s.paper else "LIVE",s.dry_run)
+    scheduler.start()
 
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()

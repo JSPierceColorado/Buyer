@@ -1,51 +1,39 @@
-# V2 buyer bot — noon Denver, Railway
+# V2 Buyer — cash-only noon Denver scheduler
 
-This is an **always-on** Python service. At **12:00 PM Denver time (`America/Denver`) every Monday–Friday**, it checks whether the Alpaca stock market is open. If open, it reads your V2 Google Sheet's `Screener` tab, selects tickers scoring **95 or higher in column G**, and places a **DAY market buy** for **2% of current Alpaca buying power** per eligible symbol. Buying power can include margin, and the amount is recalculated before every order. If the market is closed (including holidays or early-close afternoons), it skips the day.
+The buyer is a **perpetual Railway worker**. It schedules one run each Monday–Friday at **12:00 p.m. America/Denver**, following Mountain daylight saving time without Railway Cron. It does **not** place orders on startup or retries. The code remains separately reviewable at `JSPierceColorado/Buyer`.
 
-It does not write to the spreadsheet or modify column G. It **does not** check sheet freshness, universe size, old tail rows, or S&P 100 membership. Your **separate screener bot** must refresh the intended universe before noon. The buyer only reads rows 1–500 (more than enough for the S&P 100 after your row cleanup). If the sheet still contains old scores, those are eligible to trade; run the screener first.
+## Strategy
 
-## Rules
+Source: [original V2 Screener](https://docs.google.com/spreadsheets/d/14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ/edit), tab **Screener**, ticker column **A**, score column **G**.
 
-- Score in `G` must be at least **95**; symbol in `A` must be valid.
-- Skip symbols already held in Alpaca, including fractional positions.
-- Skip symbols with open orders, or already attempted under this bot's deterministic daily Alpaca order ID. These checks protect against duplicate purchases after restarts.
-- Skip stocks not tradable/fractionable, and orders under $1.
-- Trade during an open market only; 2% is of **current Alpaca `buying_power`**, which includes available margin, *not* cash or equity. Margin brings borrowing costs and forced-liquidation risk.
-- One cycle per weekday at noon; the service remains running between cycles. Railway **Cron should be left off**. A deployment started **after noon** waits until the next weekday noon; it does not immediately buy.
-- The bot never sells, limits overall portfolio exposure, or guarantees that a technical score predicts positive returns. A separate seller/risk-management strategy is required.
+- **Score must be >=95**; candidates are ranked by descending score then ticker.
+- **Not already held long:** buy **2% of currently available actual cash** in that symbol, via a market DAY **dollar-notional** order.
+- **Already held long:** instead buy **exactly $5** additional notional, once per symbol/day.
+- Every subsequent new purchase uses the remaining usable cash after locally reserving all prior submissions. It is NOT 2% of equity or margin-inflated buying power.
+- The source must contain at least 95 validated stock rows, valid original score headers, and a **same-day 9 a.m. V2 refresh timestamp plus recent completed-session date** in `Screener!I1:J2`. A missing or stale marker causes **zero buys**. The Screener publishes that marker atomically with its A:F update; G formulas remain intact.
+- Only fractionable, tradable US equities; market must be open. A short position or a pending order blocks buying that symbol. No margin purchases, crypto, options, short selling, selling, or stop-loss orders.
+- A deterministic `v2b-YYYYMMDD-SYMBOL` broker client ID prevents a restart from submitting a second same-day order for a symbol. On ambiguous order submission errors the run **aborts without retry**.
+- The model does not impose an arbitrary maximum number of qualifying tickers; the cumulative amount depends on the number of signals and cash. This strategy can allocate significant cash across multiple symbols in one session. Holdings may receive new $5 purchases on subsequent qualifying days. None of these scores guarantee gains.
 
-## Project files
+## Environment
 
-- `main.py` — scheduling, Google Sheets reads, buy logic
-- `requirements.txt` — Python dependencies
-- `Dockerfile` — Railway service image
-- `railway.json` — always-restart, no cron
-- `tests/test_main.py` — offline tests
+Railway `Investing` → service `V2-Buyer`. Connect source `JSPierceColorado/Buyer` branch `main`, one replica, **no Railway cron**. Start `python -u main.py`, restart policy `ALWAYS`.
 
-## GitHub / Railway
+| Variable | Meaning |
+| --- | --- |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Reference your Railway credential-holder service's JSON |
+| `GOOGLE_SPREADSHEET_ID` | `14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ` |
+| `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY` | Alpaca paper or live account pair (never both) |
+| `ALPACA_PAPER` | `true` for paper or `false` for live |
+| `DRY_RUN` | `true` previews, `false` permits broker submissions |
+| `LIVE_TRADING_ACK` | Required exact `I_ACCEPT_REAL_MONEY_BUYS` for live + DRY_RUN=false |
+| `MINIMUM_SCORE` | `95` |
+| `BUY_FRACTION` | `0.02` |
+| `HELD_ADDITION_USD` | `5.00` |
+| `LOG_LEVEL` | `INFO` |
 
-1. Create a private GitHub repository and upload the files to its root.
-2. In Railway, create a new service **Deploy from GitHub Repo**, one replica, always on. Do **not** configure a cron expression.
-3. Enable Google Sheets API, create a Google service-account JSON key, and share your V2 sheet with its `client_email` as a **Viewer**.
-4. Set the variables in Railway (never check secrets into the repository):
+To verify credentials, run `python main.py --check-now`; this forces **dry run**, even if the deployment's scheduled mode is live. It still enforces a valid same-day Screener marker and never submits orders. The first live order is only eligible on the following qualified scheduled noon, when market is open and the morning scan succeeded.
 
-| Variable | Default | What it does |
-| --- | --- | --- |
-| `APCA_API_KEY_ID` | Required | Alpaca key |
-| `APCA_API_SECRET_KEY` | Required | Alpaca secret |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Required | Entire Google service-account JSON |
-| `GOOGLE_SPREADSHEET_ID` | `14-Fvk8YruHeGB95lyrWtjj-KfQ-AkIjSyAf5gQdHDFQ` | V2 Sheet |
-| `GOOGLE_SHEET_TAB` | `Screener` | Source tab |
-| `MINIMUM_SCORE` | `95` | Minimum G score |
-| `BUY_FRACTION` | `0.02` | 2% of current buying power (maximum 0.02) |
-| `ALPACA_PAPER` | `true` | Paper account by default |
-| `DRY_RUN` | `true` | Log, but don't submit orders |
-| `LIVE_TRADING_ACK` | unset | Must be `I_ACCEPT_LIVE_MARGIN_RISK` to enable live trades |
+### Operational warning
 
-First test with **paper keys and `DRY_RUN=true`**. Set `DRY_RUN=false` to test paper orders. For live orders, set `ALPACA_PAPER=false`, `DRY_RUN=false`, `LIVE_TRADING_ACK=I_ACCEPT_LIVE_MARGIN_RISK`, and use live keys. Market orders and margin use real buying power and carry risk.
-
-## Testing
-
-```sh
-python -m unittest discover -s tests -v
-```
+This is a live-capable automated BUYER. Market orders do not guarantee an execution price and can immediately lose value. It never sells, and no assumption is made that a separate seller bot is deployed. Use dedicated credentials and restrict Railway secrets to the necessary service. Confirm source-sheet quality, broker cash, order journal and execution logs before relying on automated trading.

@@ -1,0 +1,21 @@
+name: V2 Buyer Safe Automation Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Python compile check
+        run: python -m compileall -q main.py
+      - name: Verify no margin sizing or stop-loss orders
+        run: |
+          ! grep -n 'account.buying_power' main.py
+          ! grep -n 'OrderSide.SELL' main.py
