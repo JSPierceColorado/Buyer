@@ -207,7 +207,7 @@ def held_and_pending(trader):
         except ValueError:
             # Invalid/unsupported symbols cannot match validated screener rows.
             ignored_positions+=1
-            LOG.warning("V2_POSITION_SKIPPED_NON_EQUITY_SYMBOL asset_class=%s",asset_class)
+            LOG.warning("V2_POSITION_SKIPPED_UNSUPPORTED_SYMBOL asset_class=%s",asset_class)
             continue
         try:
             qty=Decimal(str(position.qty))
