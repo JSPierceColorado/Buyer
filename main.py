@@ -184,23 +184,54 @@ def order_already_attempted(trader,client_id:str)->bool:
 
 
 def held_and_pending(trader):
-    from alpaca.trading.enums import QueryOrderStatus
+    """Inspect equity positions and open orders safely.
+
+    A broker account may also hold options, crypto, and other instrument symbols
+    that are not S&P 100 equity tickers. Those should never block V2's equity
+    buyer. The verified screener only supplies normalized US-equity tickers.
+    """
+    from alpaca.trading.enums import QueryOrderStatus, AssetClass
     from alpaca.trading.requests import GetOrdersRequest
     positions=trader.get_all_positions()
     if positions is None:
         raise RuntimeError("PAPER_OR_LIVE_POSITIONS_NOT_VERIFIED")
     held={}
+    ignored_positions=0
     for position in positions:
-        symbol=normalize_symbol(position.symbol)
-        qty=Decimal(str(position.qty))
-        if not qty.is_finite() or qty==0:
+        asset_class=getattr(position,"asset_class",None)
+        if asset_class is not None and asset_class!=AssetClass.US_EQUITY:
+            ignored_positions+=1
+            continue
+        try:
+            symbol=normalize_symbol(position.symbol)
+        except ValueError:
+            # Invalid/unsupported symbols cannot match validated screener rows.
+            ignored_positions+=1
+            LOG.warning("V2_POSITION_SKIPPED_NON_EQUITY_SYMBOL asset_class=%s",asset_class)
+            continue
+        try:
+            qty=Decimal(str(position.qty))
+        except (InvalidOperation,ValueError,TypeError):
+            raise RuntimeError("V2_INVALID_EQUITY_POSITION_QUANTITY") from None
+        if not qty.is_finite():
+            raise RuntimeError("V2_NONFINITE_EQUITY_POSITION_QUANTITY")
+        if qty==0:
             continue
         held[symbol]=qty
     orders=trader.get_orders(filter=GetOrdersRequest(
         status=QueryOrderStatus.OPEN,limit=500))
     if orders is None or len(orders)>=500:
         raise RuntimeError("OPEN_BROKER_ORDERS_UNVERIFIED")
-    pending={normalize_symbol(order.symbol) for order in orders}
+    pending=set()
+    ignored_orders=0
+    for order in orders:
+        try:
+            pending.add(normalize_symbol(order.symbol))
+        except ValueError:
+            ignored_orders+=1
+            continue
+    LOG.info("V2_BROKER_POSITION_CHECK held_equities=%d open_equity_orders=%d ignored_positions=%d ignored_orders=%d",
+             len(held),len(pending),ignored_positions,ignored_orders)
     return held,pending
 
 
@@ -322,6 +353,14 @@ def main():
         report=run_cycle(sheets,trader,s,datetime.now(DENVER))
         LOG.info("MANUAL_BUYER_PREVIEW status=%s",report)
         return
+    # Read-only startup check: verify Alpaca cash and mixed-instrument holdings
+    # without placing orders. This catches schema/account failures before noon.
+    _,preflight_trader=clients(s)
+    preflight_cash=available_cash(preflight_trader.get_account())
+    preflight_held,preflight_pending=held_and_pending(preflight_trader)
+    LOG.info("V2_BUYER_PREFLIGHT_OK cash_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
+             preflight_cash>0,len(preflight_held),len(preflight_pending),
+             "PAPER" if s.paper else "LIVE")
     from apscheduler.schedulers.blocking import BlockingScheduler
     scheduler=BlockingScheduler(timezone=DENVER,
         job_defaults={"coalesce":True,"max_instances":1,"misfire_grace_time":1800})
@@ -330,8 +369,8 @@ def main():
             sheets,trader=clients(s)
             report=run_cycle(sheets,trader,s,datetime.now(DENVER))
             LOG.info("DAILY_NOON_BUYER_COMPLETED report=%s",report)
-        except Exception as exc:
-            LOG.error("DAILY_NOON_BUYER_FAILED type=%s",type(exc).__name__)
+        except Exception:
+            LOG.exception("DAILY_NOON_BUYER_FAILED")
     scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
         hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
     LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
