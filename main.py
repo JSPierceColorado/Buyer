@@ -1,8 +1,8 @@
 """V2 live/paper BUYER: 12:00 America/Denver every NYSE trading weekday.
 
 Reads original V2 Screener!G, requiring a same-day verified 9AM scan marker.
-For each score >=95: buy 2% of remaining usable CASH if unheld, or $5 if
-already held long. Never use margin buying power, leverage, shorts or options.
+For each score >=95: buy 2% of remaining margin buying power if unheld, or $5 if
+already held long. Use Alpaca margin buying power; never short or trade options.
 One deterministic broker order ID per symbol/day; no blind submission retries.
 """
 from __future__ import annotations
@@ -50,7 +50,7 @@ def flag(name:str,default:bool)->bool:
 
 def money(value)->Decimal:
     if value is None or value=="":
-        raise ValueError("Missing broker cash or non-margin buying-power field")
+        raise ValueError("Missing broker buying-power field")
     try:
         d=Decimal(str(value))
     except InvalidOperation:
@@ -77,7 +77,7 @@ def settings_from_env()->Settings:
     if not SCORE_MIN<=s.threshold<=100:
         raise ValueError("Score threshold must be between 95 and 100")
     if not 0<s.fraction<=Decimal(".02"):
-        raise ValueError("Cash fraction must be 0-2%")
+        raise ValueError("Buying-power fraction must be 0-2%")
     if s.addition!=ADD_DOLLARS:
         raise ValueError("Held addition must be exactly $5")
     if not s.paper and not s.dry_run:
@@ -235,20 +235,18 @@ def held_and_pending(trader):
     return held,pending
 
 
-def available_cash(account)->Decimal:
+def available_buying_power(account)->Decimal:
     if any(bool(getattr(account,k,False)) for k in (
             "account_blocked","trading_blocked","trade_suspended_by_user")):
         raise RuntimeError("BROKER_ACCOUNT_RESTRICTED")
     status=str(getattr(account,"status",""))
     if not status.upper().endswith("ACTIVE"):
         raise RuntimeError("BROKER_ACCOUNT_NOT_ACTIVE")
-    # Important: do NOT use buying_power; it may be 2x/4x margin leverage.
-    cash=money(getattr(account,"cash",None))
-    nonmargin=money(getattr(account,"non_marginable_buying_power",None))
-    return min(cash,nonmargin)
+    # Margin buying power, as reported by Alpaca; individual assets may have stricter requirements.
+    return money(getattr(account,"buying_power",None))
 
 
-def cash_order_amount(remaining:Decimal,fraction:Decimal,held:bool)->Decimal:
+def buying_power_order_amount(remaining:Decimal,fraction:Decimal,held:bool)->Decimal:
     if held:
         return ADD_DOLLARS if remaining>=ADD_DOLLARS else Decimal(0)
     amount=(remaining*fraction).quantize(CENT,rounding=ROUND_DOWN)
@@ -261,7 +259,7 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
     results={"qualified":len(signals),"submitted":[],"preview":[],"skipped":[]}
     if not signals:return results
     account=trader.get_account()
-    remaining=available_cash(account)
+    remaining=available_buying_power(account)
     _,pending=held_and_pending(trader)
     for symbol,score in signals:
         if not trader.get_clock().is_open:
@@ -278,7 +276,7 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
         account=trader.get_account()
         remaining=min(remaining,available_cash(account))
         if remaining<MIN_ORDER:
-            results["skipped"].append((symbol,"NO_CASH"))
+            results["skipped"].append((symbol,"NO_BUYING_POWER"))
             break
         asset=trader.get_asset(symbol)
         if (not bool(getattr(asset,"tradable",False))
@@ -291,9 +289,9 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
             results["skipped"].append((symbol,"BUY_ORDER_ALREADY_ATTEMPTED_TODAY"))
             continue
         held_long=symbol in held and held[symbol]>0
-        amount=cash_order_amount(remaining,s.fraction,held_long)
+        amount=buying_power_order_amount(remaining,s.fraction,held_long)
         if amount<MIN_ORDER:
-            results["skipped"].append((symbol,"INSUFFICIENT_CASH_FOR_RULE"))
+            results["skipped"].append((symbol,"INSUFFICIENT_BUYING_POWER_FOR_RULE"))
             continue
         if s.dry_run:
             results["preview"].append((symbol,str(score),str(amount),
@@ -358,8 +356,8 @@ def main():
     _,preflight_trader=clients(s)
     preflight_cash=available_cash(preflight_trader.get_account())
     preflight_held,preflight_pending=held_and_pending(preflight_trader)
-    LOG.info("V2_BUYER_PREFLIGHT_OK cash_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
-             preflight_cash>0,len(preflight_held),len(preflight_pending),
+    LOG.info("V2_BUYER_PREFLIGHT_OK buying_power_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
+             preflight_power>0,len(preflight_held),len(preflight_pending),
              "PAPER" if s.paper else "LIVE")
     from apscheduler.schedulers.blocking import BlockingScheduler
     scheduler=BlockingScheduler(timezone=DENVER,
@@ -374,7 +372,7 @@ def main():
     scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
         hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
     LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
-             "new_entry=2pct_remaining_cash existing_long_add=$5",
+             "new_entry=2pct_remaining_margin_buying_power existing_long_add=$5",
              "PAPER" if s.paper else "LIVE",s.dry_run)
     scheduler.start()
 
