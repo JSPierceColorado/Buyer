@@ -15,7 +15,10 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Python compile check
         run: python -m compileall -q main.py
-      - name: Verify no margin sizing or stop-loss orders
+      - name: Verify margin reference and read-only startup invariants
         run: |
-          ! grep -n 'account.buying_power' main.py
+          grep -n 'available_buying_power(account)' main.py
+          grep -n 'preflight_power=available_buying_power' main.py
+          ! grep -n 'available_cash(' main.py
           ! grep -n 'OrderSide.SELL' main.py
+          ! grep -n 'SELL_ORDER' main.py
