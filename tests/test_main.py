@@ -71,7 +71,7 @@ class BrokerStub:
     def __init__(self,cash="1000",held=None,pending=None):
         self.cash=cash
         self.nmbp=cash
-        self.margin_power="1000000"
+        self.margin_power="10000"
         self.held=held or {}
         self.pending=pending or []
         self.sent=[]
@@ -140,26 +140,26 @@ class BuyerTests(unittest.TestCase):
         self.assertEqual(len(main.verified_screener_signals(
             SheetStub(rows),fake_settings(),NOW)),2)
 
-    def test_cash_only_no_margin_and_five_dollar_held_add(self):
+    def test_margin_buying_power_and_five_dollar_held_add(self):
         modules,_=stub_modules()
         trader=BrokerStub("1000",held={"MSFT":"0.33333"})
         with patch.dict(sys.modules,modules):
             result=main.buy_signals(trader,[("AAPL",Decimal(99)),("MSFT",Decimal(95))],
                 fake_settings(dry_run=False),NOW.date().isoformat())
         self.assertEqual(len(trader.sent),2)
-        self.assertEqual(trader.sent[0]["notional"],20.0)
+        self.assertEqual(trader.sent[0]["notional"],200.0)
         self.assertEqual(trader.sent[1]["notional"],5.0)
         self.assertEqual(trader.sent[1]["symbol"],"MSFT")
         self.assertEqual(trader.sent[1]["side"],"buy")
         self.assertEqual(result["submitted"][1][4],"ADD_HELD")
 
-    def test_remaining_cash_reduced_for_sequential_new_entries(self):
+    def test_remaining_margin_buying_power_reduced_for_sequential_new_entries(self):
         modules,_=stub_modules()
         trader=BrokerStub("1000")
         with patch.dict(sys.modules,modules):
             main.buy_signals(trader,[("AAPL",Decimal(99)),("MSFT",Decimal(98))],
                 fake_settings(dry_run=False),NOW.date().isoformat())
-        self.assertEqual([x["notional"] for x in trader.sent],[20.0,19.6])
+        self.assertEqual([x["notional"] for x in trader.sent],[200.0,196.0])
 
     def test_order_dedupes_after_restarts(self):
         modules,_=stub_modules()
@@ -179,15 +179,50 @@ class BuyerTests(unittest.TestCase):
         self.assertEqual(len(trader.sent),0)
         self.assertEqual(len(r["skipped"]),2)
 
-    def test_account_cash_missing_fails_closed(self):
-        class NoCash:
-            cash=None
-            non_marginable_buying_power="10000"
+    def test_missing_buying_power_fails_closed(self):
+        class NoBuyingPower:
+            buying_power=None
             status="ACTIVE"
         with self.assertRaises(ValueError):
-            main.available_cash(NoCash())
-        self.assertEqual(main.cash_order_amount(Decimal("4"),Decimal(".02"),True),0)
-        self.assertEqual(main.cash_order_amount(Decimal("49"),Decimal(".02"),False),0)
+            main.available_buying_power(NoBuyingPower())
+        self.assertEqual(main.buying_power_order_amount(Decimal("4"),Decimal(".02"),True),0)
+        self.assertEqual(main.buying_power_order_amount(Decimal("49"),Decimal(".02"),False),0)
+
+    def test_margin_power_not_cash_drives_new_entry(self):
+        modules,_=stub_modules()
+        trader=BrokerStub("0")
+        trader.margin_power="5000"
+        with patch.dict(sys.modules,modules):
+            result=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),NOW.date().isoformat())
+        self.assertEqual(result["qualified"],1)
+        self.assertEqual([x["notional"] for x in trader.sent],[100.0])
+
+    def test_fresh_margin_power_limits_subsequent_entries(self):
+        modules,_=stub_modules()
+        trader=BrokerStub("0")
+        trader.margin_power="10000"
+        original=trader.get_account
+        def account():
+            result=original()
+            if trader.sent:
+                result.buying_power="150"
+            return result
+        trader.get_account=account
+        with patch.dict(sys.modules,modules):
+            main.buy_signals(trader,[("AAPL",Decimal("99")),("MSFT",Decimal("98"))],
+                fake_settings(dry_run=False),NOW.date().isoformat())
+        self.assertEqual([x["notional"] for x in trader.sent],[200.0,3.0])
+
+    def test_insufficient_margin_power_aborts_before_order(self):
+        modules,_=stub_modules()
+        trader=BrokerStub("1000")
+        trader.margin_power="0"
+        with patch.dict(sys.modules,modules):
+            r=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),NOW.date().isoformat())
+        self.assertEqual(trader.sent,[])
+        self.assertEqual(r["skipped"],[("AAPL","NO_BUYING_POWER")])
 
     def test_submissions_never_retried_after_unknown_response(self):
         modules,_=stub_modules()
@@ -239,10 +274,13 @@ class BuyerTests(unittest.TestCase):
         modules={"apscheduler":ModuleType("apscheduler"),
                  "apscheduler.schedulers":ModuleType("apscheduler.schedulers"),
                  "apscheduler.schedulers.blocking":module}
-        with patch.dict(sys.modules,modules), patch("sys.argv",["main.py"]):
-            with patch.object(main,"settings_from_env",return_value=fake_settings()):
+        trader=BrokerStub("0")
+        trader.margin_power="10000"
+        with patch.dict(sys.modules,{**stub_modules()[0],**modules}), patch("sys.argv",["main.py"]):
+            with patch.object(main,"settings_from_env",return_value=fake_settings()), patch.object(main,"clients",return_value=(SheetStub(good_rows()),trader)):
                 main.main()
         self.assertTrue(scheduled["started"])
+        self.assertEqual(trader.sent,[],"Scheduler startup must not send orders")
         self.assertEqual(scheduled["init"]["timezone"],main.DENVER)
         callback,kind,params=scheduled["job"]
         self.assertEqual(kind,"cron")
