@@ -274,7 +274,7 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
             results["skipped"].append((symbol,"SHORT_POSITION_NOT_ELIGIBLE"))
             continue
         account=trader.get_account()
-        remaining=min(remaining,available_cash(account))
+        remaining=min(remaining,available_buying_power(account))
         if remaining<MIN_ORDER:
             results["skipped"].append((symbol,"NO_BUYING_POWER"))
             break
@@ -311,7 +311,7 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
                                         "ADD_HELD" if held_long else "NEW_ENTRY"))
             LOG.warning("SUBMITTED_%s symbol=%s score=%s dollars=%s client_id=%s",
                 "LIVE" if not s.paper else "PAPER",symbol,score,amount,cid)
-        remaining-=amount  # Reserve locally even if Alpaca cash has not updated.
+        remaining-=amount  # Reserve locally even if Alpaca buying power has not updated.
     LOG.info("V2_BUY_CYCLE qualified=%s ordered=%d preview=%d skipped=%d mode=%s",
              len(signals),len(results["submitted"]),len(results["preview"]),
              len(results["skipped"]),"DRY_RUN" if s.dry_run else ("PAPER" if s.paper else "LIVE"))
@@ -351,10 +351,10 @@ def main():
         report=run_cycle(sheets,trader,s,datetime.now(DENVER))
         LOG.info("MANUAL_BUYER_PREVIEW status=%s",report)
         return
-    # Read-only startup check: verify Alpaca cash and mixed-instrument holdings
+    # Read-only startup check: verify Alpaca buying power and mixed-instrument holdings
     # without placing orders. This catches schema/account failures before noon.
     _,preflight_trader=clients(s)
-    preflight_cash=available_cash(preflight_trader.get_account())
+    preflight_power=available_buying_power(preflight_trader.get_account())
     preflight_held,preflight_pending=held_and_pending(preflight_trader)
     LOG.info("V2_BUYER_PREFLIGHT_OK buying_power_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
              preflight_power>0,len(preflight_held),len(preflight_pending),
