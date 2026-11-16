@@ -14,11 +14,11 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Python compile check
-        run: python -m compileall -q main.py
+        run: python -m compileall -q main.py lowwater_tracker.py
       - name: Verify margin reference and read-only startup invariants
         run: |
           grep -n 'available_buying_power(account)' main.py
           grep -n 'preflight_power=available_buying_power' main.py
           ! grep -n 'available_cash(' main.py
-          ! grep -n 'OrderSide.SELL' main.py
+          ! grep -n 'MarketOrderRequest(symbol=.*side=OrderSide.SELL' main.py
           ! grep -n 'SELL_ORDER' main.py

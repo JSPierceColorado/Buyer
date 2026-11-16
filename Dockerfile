@@ -6,6 +6,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py ./
+COPY lowwater_tracker.py ./
 COPY tests ./tests
-RUN python -m compileall -q main.py && python -m unittest discover -s tests -v
+RUN python -m compileall -q main.py lowwater_tracker.py && python -m unittest discover -s tests -v
 CMD ["python", "main.py"]

@@ -1,4 +1,4 @@
-# V2 Buyer — margin-buying-power noon Denver scheduler
+# V2 Buyer — single-writer S&P100 low-water ladder + noon Denver scheduler
 
 The buyer is a **perpetual Railway worker**. It schedules one run each Monday–Friday at **12:00 p.m. America/Denver**, following Mountain daylight saving time without Railway Cron. It does **not** place orders on startup or retries. The code remains separately reviewable at `JSPierceColorado/Buyer`.
 
@@ -8,13 +8,19 @@ Source: [original V2 Screener](https://docs.google.com/spreadsheets/d/14-Fvk8Yru
 
 - **Score must be >=95**; candidates are ranked by descending score then ticker.
 - **Not already held long:** buy **2% of current Alpaca margin buying power** in that symbol, via a market DAY **dollar-notional** order.
-- **Already held long:** add only when the broker's current price is **below** the position's average entry price and broker unrealized gain agrees with that drawdown. Order size is **0.1% of remaining margin buying power for each 1% the position is below its average entry**, capped at **0.5% of remaining margin buying power** per symbol. Below $1, skip. Examples at $10,000 buying power: -1% → $10; -3% → $30; -5% or worse → $50. No held-position top-up at or above average entry price.
+- **S&P100 held positions:** the persistent low-water ledger samples current broker price **once at noon each NY trading day**. First observation seeds the reference, with no purchase. Future steps require a strictly new observed low at least **1% below the previous filled step price** and price below average entry. All held S&P100 stocks are eligible, even when their Screener score is below 95.
+- **Six steps:** 5%, 10%, 20%, 40%, 80%, then 100% of initial recorded position cost. A $100 initial position receives $5, $10, $20, $40, $80, then $100: $255 added, $355 total before gains/losses. Minimum $1 order and sufficient buying power. No seventh purchase.
+- **Review flag:** after six confirmed fills set persistent `CAP_REACHED_REVIEW_REQUIRED` and log `LOWWATER_REVIEW_REQUIRED`. Unfilled, uncertain, or externally increased positions also pause for review. A step only advances after Alpaca confirms a filled order.
+- **Non-S&P100 held positions:** no top-ups. Their existing conditional -5% stop remains unchanged. New holdings can still be purchased when they qualify.
+- **One owner:** V2-Buyer alone writes the low-water ledger and adds to held stocks. AI Recommendations Buyer may open new positions, but skips all held stocks even when high-confidence.
+- **Persistence:** Railway volume named `v2-lowwater` mounted at `/data` stores active position episodes, observed daily lows, fill steps, order IDs and flags. Initial basis for an existing holding is its aggregate cost at first observation; no inaccurate historical order reconstruction. An external held-quantity increase triggers review.
+- **Risk:** the ladder can reach 3.55x initial position basis; this is a per-position ladder cap, not a guaranteed account-wide leverage limit.
 - **Re-entry cooldown after a confirmed stop-loss only:** a positive filled quantity on a `v2sl-YYYYMMDD-TICKER` sell order this trading week blocks ALL new/additional buys of that symbol through Sunday; it is eligible again the next Monday (New York trading calendar). A Monday stop blocks through the weekend; a Friday stop expires the coming Monday. Profitable `v2sg-` exits never impose a cooldown. All order history must reconcile, otherwise that buying cycle fails closed. Legacy `v2s-` IDs cannot be classified by exit reason and are not retroactively blocked.
 - Every subsequent purchase uses the lesser of remaining locally reserved buying power and fresh broker-reported buying power. This is **not** 2% of cash or account equity. Margin buying power may reflect leveraged purchasing capacity and can create margin debt/interest.
 - The source must contain at least 95 validated stock rows, valid original score headers, and a **same-day 9 a.m. V2 refresh timestamp plus recent completed-session date** in `Screener!I1:J2`. A missing or stale marker causes **zero buys**. The Screener publishes that marker atomically with its A:F update; G formulas remain intact.
 - Only fractionable, tradable US equities; market must be open. A short position or a pending order blocks buying that symbol. No crypto, options, short selling, selling, or stop-loss orders.
 - A deterministic `v2b-YYYYMMDD-SYMBOL` broker client ID prevents a restart from submitting a second same-day order for a symbol. On ambiguous order submission errors the run **aborts without retry**.
-- The model does not impose an arbitrary maximum number of qualifying tickers; the cumulative amount depends on the number of signals and available margin buying power. This strategy can allocate significant cash across multiple symbols in one session. Holdings may receive scaled below-entry purchases on subsequent qualifying days, except during a stop-loss cooldown. None of these scores guarantee gains.
+- The model does not impose an arbitrary maximum number of qualifying tickers; the cumulative amount depends on the number of signals and available margin buying power. This strategy can allocate significant cash across multiple symbols in one session. S&P100 holdings may receive ladder purchases after qualifying daily lows; non-S&P100 holdings receive no additions. None of these scores guarantee gains.
 
 ## Environment
 
@@ -30,7 +36,7 @@ Railway `Investing` → service `V2-Buyer`. Connect source `JSPierceColorado/Buy
 | `LIVE_TRADING_ACK` | Required exact `I_ACCEPT_REAL_MONEY_BUYS` for live + DRY_RUN=false |
 | `MINIMUM_SCORE` | `95` |
 | `BUY_FRACTION` | `0.02` |
-| `HELD_ADDITION_USD` | Legacy only: ignored; held additions now use the drawdown-sizing formula. |
+| `HELD_ADDITION_USD` | Legacy only: ignored; held additions use the persistent six-step S&P100 low-water ladder. |
 | `LOG_LEVEL` | `INFO` |
 
 To verify credentials, run `python main.py --check-now`; this forces **dry run**, even if the deployment's scheduled mode is live. It still enforces a valid same-day Screener marker and never submits orders. The first live order is only eligible on the following qualified scheduled noon, when market is open and the morning scan succeeded.
