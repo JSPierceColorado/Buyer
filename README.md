@@ -8,12 +8,13 @@ Source: [original V2 Screener](https://docs.google.com/spreadsheets/d/14-Fvk8Yru
 
 - **Score must be >=95**; candidates are ranked by descending score then ticker.
 - **Not already held long:** buy **2% of current Alpaca margin buying power** in that symbol, via a market DAY **dollar-notional** order.
-- **Already held long:** instead buy **exactly $5** additional notional, once per symbol/day.
-- Every subsequent new purchase uses the lesser of remaining locally reserved buying power and fresh broker-reported buying power. This is **not** 2% of cash or account equity. Margin buying power may reflect leveraged purchasing capacity and can create margin debt/interest.
+- **Already held long:** add only when the broker's current price is **below** the position's average entry price and broker unrealized gain agrees with that drawdown. Order size is **0.1% of remaining margin buying power for each 1% the position is below its average entry**, capped at **0.5% of remaining margin buying power** per symbol. Below $1, skip. Examples at $10,000 buying power: -1% → $10; -3% → $30; -5% or worse → $50. No held-position top-up at or above average entry price.
+- **Re-entry cooldown after a confirmed stop-loss only:** a positive filled quantity on a `v2sl-YYYYMMDD-TICKER` sell order this trading week blocks ALL new/additional buys of that symbol through Sunday; it is eligible again the next Monday (New York trading calendar). A Monday stop blocks through the weekend; a Friday stop expires the coming Monday. Profitable `v2sg-` exits never impose a cooldown. All order history must reconcile, otherwise that buying cycle fails closed. Legacy `v2s-` IDs cannot be classified by exit reason and are not retroactively blocked.
+- Every subsequent purchase uses the lesser of remaining locally reserved buying power and fresh broker-reported buying power. This is **not** 2% of cash or account equity. Margin buying power may reflect leveraged purchasing capacity and can create margin debt/interest.
 - The source must contain at least 95 validated stock rows, valid original score headers, and a **same-day 9 a.m. V2 refresh timestamp plus recent completed-session date** in `Screener!I1:J2`. A missing or stale marker causes **zero buys**. The Screener publishes that marker atomically with its A:F update; G formulas remain intact.
 - Only fractionable, tradable US equities; market must be open. A short position or a pending order blocks buying that symbol. No crypto, options, short selling, selling, or stop-loss orders.
 - A deterministic `v2b-YYYYMMDD-SYMBOL` broker client ID prevents a restart from submitting a second same-day order for a symbol. On ambiguous order submission errors the run **aborts without retry**.
-- The model does not impose an arbitrary maximum number of qualifying tickers; the cumulative amount depends on the number of signals and available margin buying power. This strategy can allocate significant cash across multiple symbols in one session. Holdings may receive new $5 purchases on subsequent qualifying days. None of these scores guarantee gains.
+- The model does not impose an arbitrary maximum number of qualifying tickers; the cumulative amount depends on the number of signals and available margin buying power. This strategy can allocate significant cash across multiple symbols in one session. Holdings may receive scaled below-entry purchases on subsequent qualifying days, except during a stop-loss cooldown. None of these scores guarantee gains.
 
 ## Environment
 
@@ -29,7 +30,7 @@ Railway `Investing` → service `V2-Buyer`. Connect source `JSPierceColorado/Buy
 | `LIVE_TRADING_ACK` | Required exact `I_ACCEPT_REAL_MONEY_BUYS` for live + DRY_RUN=false |
 | `MINIMUM_SCORE` | `95` |
 | `BUY_FRACTION` | `0.02` |
-| `HELD_ADDITION_USD` | `5.00` |
+| `HELD_ADDITION_USD` | Legacy only: ignored; held additions now use the drawdown-sizing formula. |
 | `LOG_LEVEL` | `INFO` |
 
 To verify credentials, run `python main.py --check-now`; this forces **dry run**, even if the deployment's scheduled mode is live. It still enforces a valid same-day Screener marker and never submits orders. The first live order is only eligible on the following qualified scheduled noon, when market is open and the morning scan succeeded.

@@ -1,8 +1,10 @@
 """V2 live/paper BUYER: 12:00 America/Denver every NYSE trading weekday.
 
 Reads original V2 Screener!G, requiring a same-day verified 9AM scan marker.
-For each score >=95: buy 2% of remaining margin buying power if unheld, or $5 if
-already held long. Use Alpaca margin buying power; never short or trade options.
+For each score >=95: buy 2% of remaining margin buying power if unheld; held
+positions are added to only while below average entry price, scaling from
+0.1% of margin buying power per 1% unrealized drawdown (capped at 0.5%).
+Stop-loss sales block reentry until the following Monday; profit exits do not.
 One deterministic broker order ID per symbol/day; no blind submission retries.
 """
 from __future__ import annotations
@@ -13,7 +15,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date, time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
@@ -24,7 +26,8 @@ LOG=logging.getLogger("v2-buyer")
 CENT=Decimal("0.01")
 SCORE_MIN=Decimal("95")
 MIN_ORDER=Decimal("1.00")
-ADD_DOLLARS=Decimal("5.00")
+MAX_HELD_FRACTION=Decimal("0.005")
+HELD_FRACTION_PER_DRAWDOWN=Decimal("0.10")
 SYMBOL_RE=re.compile(r"[A-Z][A-Z0-9.\-]{0,10}")
 
 
@@ -70,7 +73,7 @@ def settings_from_env()->Settings:
         dry_run=flag("DRY_RUN",True),
         threshold=money(os.getenv("MINIMUM_SCORE","95")),
         fraction=money(os.getenv("BUY_FRACTION","0.02")),
-        addition=money(os.getenv("HELD_ADDITION_USD","5.00"))
+        addition=Decimal("0")  # Legacy settings field, no longer used for held additions.
     )
     if not all((s.alpaca_key,s.alpaca_secret,s.google_credentials_json,s.sheet_id)):
         raise ValueError("Missing broker or Sheet credentials")
@@ -78,8 +81,6 @@ def settings_from_env()->Settings:
         raise ValueError("Score threshold must be between 95 and 100")
     if not 0<s.fraction<=Decimal(".02"):
         raise ValueError("Buying-power fraction must be 0-2%")
-    if s.addition!=ADD_DOLLARS:
-        raise ValueError("Held addition must be exactly $5")
     if not s.paper and not s.dry_run:
         if os.getenv("LIVE_TRADING_ACK")!="I_ACCEPT_REAL_MONEY_BUYS":
             raise ValueError("Explicit LIVE_TRADING_ACK required for actual real-money orders")
@@ -248,9 +249,63 @@ def available_buying_power(account)->Decimal:
 
 def buying_power_order_amount(remaining:Decimal,fraction:Decimal,held:bool)->Decimal:
     if held:
-        return ADD_DOLLARS if remaining>=ADD_DOLLARS else Decimal(0)
+        return Decimal(0)  # Additions need fresh validated broker price and entry basis.
     amount=(remaining*fraction).quantize(CENT,rounding=ROUND_DOWN)
     return amount if amount>=MIN_ORDER else Decimal(0)
+
+
+def held_rebuy_amount(remaining:Decimal,position)->Decimal:
+    """0.1% BP / 1% drawdown, capped at 0.5% BP; never buy at/above entry."""
+    try:
+        entry=Decimal(str(getattr(position,"avg_entry_price",None)))
+        price=Decimal(str(getattr(position,"current_price",None)))
+        ratio=Decimal(str(getattr(position,"unrealized_plpc",None)))
+        qty=Decimal(str(getattr(position,"qty",None)))
+        if not all(x.is_finite() for x in (entry,price,ratio,qty)):
+            return Decimal(0)
+        if entry<=0 or price<=0 or qty<=0 or price>=entry or ratio>=0:
+            return Decimal(0)
+        drawdown=(entry-price)/entry
+        if abs(-drawdown-ratio)>Decimal(".01"):
+            return Decimal(0)  # Inconsistent cost or stale quote; no order.
+        frac=min(MAX_HELD_FRACTION,drawdown*HELD_FRACTION_PER_DRAWDOWN)
+        amount=(remaining*frac).quantize(CENT,rounding=ROUND_DOWN)
+        return amount if amount>=MIN_ORDER else Decimal(0)
+    except (InvalidOperation,TypeError,ValueError):
+        return Decimal(0)
+
+
+def stopped_this_week(trader,day:str)->set[str]:
+    """Only filled V2 stop sells; Monday ET begins a fresh eligible week.
+
+    No local state sharing or inferred reasons: v2sl is the stop-only ID.
+    Any incomplete order-history response fails closed rather than re-buying.
+    """
+    from alpaca.trading.enums import QueryOrderStatus,OrderSide
+    from alpaca.trading.requests import GetOrdersRequest
+    current_day=date.fromisoformat(day)
+    monday=current_day-timedelta(days=current_day.weekday())
+    start=datetime.combine(monday,time.min,tzinfo=NEW_YORK)
+    orders=trader.get_orders(filter=GetOrdersRequest(
+        status=QueryOrderStatus.ALL,limit=500,after=start,
+        side=OrderSide.SELL,nested=False))
+    if orders is None or len(orders)>=500:
+        raise RuntimeError("WEEKLY_STOP_ORDER_HISTORY_UNVERIFIABLE")
+    stopped=set()
+    for order in orders:
+        cid=str(getattr(order,"client_order_id","") or "").lower()
+        if not re.fullmatch(r"v2sl-\d{8}-[a-z0-9-]+",cid):
+            continue
+        filled=Decimal(str(getattr(order,"filled_qty",None)))
+        if not filled.is_finite() or filled<0:
+            raise RuntimeError("WEEKLY_STOP_FILL_QUANTITY_INVALID")
+        if filled==0:
+            continue
+        submitted=getattr(order,"submitted_at",None)
+        if submitted is None or submitted.tzinfo is None or submitted<start:
+            raise RuntimeError("WEEKLY_STOP_ORDER_DATE_UNVERIFIABLE")
+        stopped.add(normalize_symbol(order.symbol))
+    return stopped
 
 
 def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dict:
@@ -261,12 +316,19 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
     account=trader.get_account()
     remaining=available_buying_power(account)
     _,pending=held_and_pending(trader)
+    stopped=stopped_this_week(trader,day)
+    if stopped:
+        LOG.info("WEEKLY_STOP_COOLDOWN blocked=%s week_start_ny=%s",
+                 sorted(stopped),day)
     for symbol,score in signals:
         if not trader.get_clock().is_open:
             LOG.warning("MARKET_CLOSED_DURING_CYCLE; stopping")
             break
         # Every symbol must pass fresh broker checks, not assumptions from a sheet.
         held,current_pending=held_and_pending(trader)
+        if symbol in stopped:
+            results["skipped"].append((symbol,"STOPPED_THIS_WEEK"))
+            continue
         if symbol in pending or symbol in current_pending:
             results["skipped"].append((symbol,"OPEN_ORDER"))
             continue
@@ -289,10 +351,21 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
             results["skipped"].append((symbol,"BUY_ORDER_ALREADY_ATTEMPTED_TODAY"))
             continue
         held_long=symbol in held and held[symbol]>0
-        amount=buying_power_order_amount(remaining,s.fraction,held_long)
-        if amount<MIN_ORDER:
-            results["skipped"].append((symbol,"INSUFFICIENT_BUYING_POWER_FOR_RULE"))
-            continue
+        if held_long:
+            try:
+                actual=trader.get_open_position(symbol)
+                amount=held_rebuy_amount(remaining,actual)
+            except Exception:
+                LOG.warning("HELD_POSITION_UNVERIFIABLE symbol=%s",symbol)
+                amount=Decimal(0)
+            if amount<MIN_ORDER:
+                results["skipped"].append((symbol,"HELD_NOT_BELOW_ENTRY_OR_BELOW_MINIMUM"))
+                continue
+        else:
+            amount=buying_power_order_amount(remaining,s.fraction,False)
+            if amount<MIN_ORDER:
+                results["skipped"].append((symbol,"INSUFFICIENT_BUYING_POWER_FOR_RULE"))
+                continue
         if s.dry_run:
             results["preview"].append((symbol,str(score),str(amount),
                                        "ADD_HELD" if held_long else "NEW_ENTRY"))
@@ -372,7 +445,7 @@ def main():
     scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
         hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
     LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
-             "new_entry=2pct_remaining_margin_buying_power existing_long_add=$5",
+             "new_entry=2pct_remaining_margin_buying_power held_add_scaling=0.1pctBP_per_1pct_drawdown capped=0.5pctBP weekly_stop_cooldown=MONDAY",
              "PAPER" if s.paper else "LIVE",s.dry_run)
     scheduler.start()
 

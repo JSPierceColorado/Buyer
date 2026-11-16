@@ -60,9 +60,9 @@ def stub_modules():
     types["alpaca.trading.requests"].MarketOrderRequest=Request
     types["alpaca.trading.requests"].GetOrdersRequest=Request
     types["alpaca.trading.enums"].AssetClass=SimpleNamespace(US_EQUITY="us_equity")
-    types["alpaca.trading.enums"].OrderSide=SimpleNamespace(BUY="buy")
+    types["alpaca.trading.enums"].OrderSide=SimpleNamespace(BUY="buy",SELL="sell")
     types["alpaca.trading.enums"].TimeInForce=SimpleNamespace(DAY="day")
-    types["alpaca.trading.enums"].QueryOrderStatus=SimpleNamespace(OPEN="open")
+    types["alpaca.trading.enums"].QueryOrderStatus=SimpleNamespace(OPEN="open",ALL="all")
     types["alpaca.common.exceptions"].APIError=APIError
     return types,APIError
 
@@ -74,6 +74,8 @@ class BrokerStub:
         self.margin_power="10000"
         self.held=held or {}
         self.pending=pending or []
+        self.weekly_orders=[]
+        self.held_prices={}
         self.sent=[]
         self.attempted=set()
         self.open=True
@@ -87,7 +89,19 @@ class BrokerStub:
     def get_all_positions(self):
         return [SimpleNamespace(symbol=k,qty=str(v)) for k,v in self.held.items()]
     def get_orders(self,filter=None):
+        status=filter.kwargs.get("status") if filter else None
+        if status=="all":
+            after=filter.kwargs.get("after")
+            return [x for x in self.weekly_orders if x.submitted_at>after]
         return [SimpleNamespace(symbol=x) for x in self.pending]
+    def get_open_position(self,symbol):
+        if symbol not in self.held:
+            raise ValueError("not held")
+        price=self.held_prices.get(symbol,"97")
+        entry="100"
+        return SimpleNamespace(symbol=symbol,qty=self.held[symbol],
+            avg_entry_price=entry,current_price=price,
+            unrealized_plpc=str(Decimal(price)/Decimal(entry)-1))
     def get_order_by_client_id(self,id):
         from alpaca.common.exceptions import APIError
         if id in self.attempted:return SimpleNamespace(id=id)
@@ -140,7 +154,81 @@ class BuyerTests(unittest.TestCase):
         self.assertEqual(len(main.verified_screener_signals(
             SheetStub(rows),fake_settings(),NOW)),2)
 
-    def test_margin_buying_power_and_five_dollar_held_add(self):
+    def test_scaling_below_entry_and_cap(self):
+        from types import SimpleNamespace
+        def p(price):
+            return SimpleNamespace(avg_entry_price="100",current_price=str(price),
+                unrealized_plpc=str(Decimal(price)/Decimal("100")-1),qty="1")
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("101")),0)
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("100")),0)
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("99")),Decimal("10.00"))
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("97")),Decimal("30.00"))
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("94")),Decimal("50.00"))
+        stale=p("97");stale.unrealized_plpc=".02"
+        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),stale),0)
+
+    def test_held_above_entry_never_added(self):
+        modules,_=stub_modules()
+        trader=BrokerStub(held={"AAPL":"1"});trader.held_prices["AAPL"]="101"
+        with patch.dict(sys.modules,modules):
+            r=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),NOW.date().isoformat())
+        self.assertEqual(trader.sent,[])
+        self.assertEqual(r["skipped"][0][1],"HELD_NOT_BELOW_ENTRY_OR_BELOW_MINIMUM")
+
+    def test_filled_stop_blocks_both_new_and_held_until_next_monday(self):
+        modules,_=stub_modules()
+        trader=BrokerStub()
+        trader.weekly_orders=[SimpleNamespace(
+            symbol="AAPL",client_order_id="v2sl-20261109-AAPL",
+            filled_qty="0.5",submitted_at=datetime(2026,11,9,14,0,tzinfo=main.NEW_YORK))]
+        with patch.dict(sys.modules,modules):
+            monday=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),"2026-11-09")
+            friday=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),"2026-11-13")
+            next_monday=main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                fake_settings(dry_run=False),"2026-11-16")
+        self.assertEqual(monday["skipped"],[("AAPL","STOPPED_THIS_WEEK")])
+        self.assertEqual(friday["skipped"],[("AAPL","STOPPED_THIS_WEEK")])
+        self.assertEqual(next_monday["submitted"][0][0],"AAPL")
+
+    def test_friday_stop_is_free_next_monday(self):
+        modules,_=stub_modules()
+        trader=BrokerStub()
+        trader.weekly_orders=[SimpleNamespace(
+            symbol="AAPL",client_order_id="v2sl-20261113-AAPL",
+            filled_qty="1",submitted_at=datetime(2026,11,13,15,tzinfo=main.NEW_YORK))]
+        with patch.dict(sys.modules,modules):
+            self.assertIn("AAPL",main.stopped_this_week(trader,"2026-11-13"))
+            self.assertNotIn("AAPL",main.stopped_this_week(trader,"2026-11-16"))
+
+    def test_profit_sells_and_unfilled_stops_do_not_cooldown(self):
+        modules,_=stub_modules()
+        trader=BrokerStub()
+        trader.weekly_orders=[
+            SimpleNamespace(symbol="KO",client_order_id="v2sg-20261109-KO",filled_qty="1",
+                submitted_at=datetime(2026,11,9,15,tzinfo=main.NEW_YORK)),
+            SimpleNamespace(symbol="AAPL",client_order_id="v2sl-20261109-AAPL",filled_qty="0",
+                submitted_at=datetime(2026,11,9,15,tzinfo=main.NEW_YORK))]
+        with patch.dict(sys.modules,modules):
+            self.assertEqual(main.stopped_this_week(trader,"2026-11-09"),set())
+
+    def test_unverifiable_weekly_history_aborts_without_buying(self):
+        modules,_=stub_modules()
+        trader=BrokerStub()
+        def bad(filter=None):
+            if filter.kwargs.get("status")=="all":
+                return [SimpleNamespace()] * 500
+            return []
+        trader.get_orders=bad
+        with patch.dict(sys.modules,modules):
+            with self.assertRaisesRegex(RuntimeError,"WEEKLY_STOP_ORDER_HISTORY_UNVERIFIABLE"):
+                main.buy_signals(trader,[("AAPL",Decimal("99"))],
+                    fake_settings(dry_run=False),NOW.date().isoformat())
+        self.assertEqual(trader.sent,[])
+
+    def test_margin_buying_power_and_scaled_held_add(self):
         modules,_=stub_modules()
         trader=BrokerStub("1000",held={"MSFT":"0.33333"})
         with patch.dict(sys.modules,modules):
@@ -148,7 +236,7 @@ class BuyerTests(unittest.TestCase):
                 fake_settings(dry_run=False),NOW.date().isoformat())
         self.assertEqual(len(trader.sent),2)
         self.assertEqual(trader.sent[0]["notional"],200.0)
-        self.assertEqual(trader.sent[1]["notional"],5.0)
+        self.assertEqual(trader.sent[1]["notional"],29.4)
         self.assertEqual(trader.sent[1]["symbol"],"MSFT")
         self.assertEqual(trader.sent[1]["side"],"buy")
         self.assertEqual(result["submitted"][1][4],"ADD_HELD")
