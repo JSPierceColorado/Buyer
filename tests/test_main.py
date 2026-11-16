@@ -116,6 +116,33 @@ class BrokerStub:
 
 
 class BuyerTests(unittest.TestCase):
+    def test_verified_snapshot_returns_full_membership_and_score_signals(self):
+        sheet=SheetStub(good_rows())
+        scored,members=main.verified_screener_snapshot(sheet,fake_settings(),NOW)
+        self.assertEqual(len(members),101)
+        self.assertEqual(scored,[("AAPL",Decimal("99")),("MSFT",Decimal("95"))])
+        self.assertIn("SYM42",members)
+
+    def test_lowwater_sweep_only_interacts_with_sp100_positions(self):
+        class PositionBroker(BrokerStub):
+            def get_all_positions(self):
+                def p(symbol,price):
+                    return SimpleNamespace(symbol=symbol,qty="1",
+                        asset_class="us_equity",side="long",
+                        avg_entry_price="100",current_price=price,
+                        unrealized_plpc=str(Decimal(price)/Decimal(100)-1))
+                return [p("AAPL","97"),p("OTHER","92")]
+        broker=PositionBroker()
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as directory,patch.object(
+                main.lowwater_tracker,"DB_PATH",directory+"/ladder.sqlite"):
+            with patch.dict(sys.modules,stub_modules()[0]):
+                result=main.run_lowwater_sweep(broker,{"AAPL"},fake_settings(dry_run=False),"2026-11-09")
+        self.assertEqual(result["sampled"],1)
+        self.assertEqual(result["seeded"],1)
+        self.assertEqual(result["submitted"],0)
+        self.assertEqual(broker.sent,[])
+
     def test_noon_and_dst(self):
         self.assertEqual(main.next_noon(datetime(2026,7,6,11,tzinfo=main.DENVER)).isoformat(),
                          "2026-07-06T12:00:00-06:00")
@@ -154,19 +181,6 @@ class BuyerTests(unittest.TestCase):
         self.assertEqual(len(main.verified_screener_signals(
             SheetStub(rows),fake_settings(),NOW)),2)
 
-    def test_scaling_below_entry_and_cap(self):
-        from types import SimpleNamespace
-        def p(price):
-            return SimpleNamespace(avg_entry_price="100",current_price=str(price),
-                unrealized_plpc=str(Decimal(price)/Decimal("100")-1),qty="1")
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("101")),0)
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("100")),0)
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("99")),Decimal("10.00"))
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("97")),Decimal("30.00"))
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),p("94")),Decimal("50.00"))
-        stale=p("97");stale.unrealized_plpc=".02"
-        self.assertEqual(main.held_rebuy_amount(Decimal("10000"),stale),0)
-
     def test_held_above_entry_never_added(self):
         modules,_=stub_modules()
         trader=BrokerStub(held={"AAPL":"1"});trader.held_prices["AAPL"]="101"
@@ -174,7 +188,7 @@ class BuyerTests(unittest.TestCase):
             r=main.buy_signals(trader,[("AAPL",Decimal("99"))],
                 fake_settings(dry_run=False),NOW.date().isoformat())
         self.assertEqual(trader.sent,[])
-        self.assertEqual(r["skipped"][0][1],"HELD_NOT_BELOW_ENTRY_OR_BELOW_MINIMUM")
+        self.assertEqual(r["skipped"][0][1],"HELD_HANDLED_BY_LOWWATER")
 
     def test_filled_stop_blocks_both_new_and_held_until_next_monday(self):
         modules,_=stub_modules()
@@ -228,18 +242,16 @@ class BuyerTests(unittest.TestCase):
                     fake_settings(dry_run=False),NOW.date().isoformat())
         self.assertEqual(trader.sent,[])
 
-    def test_margin_buying_power_and_scaled_held_add(self):
+    def test_margin_buying_power_and_held_positions_not_added_by_old_buyer(self):
         modules,_=stub_modules()
         trader=BrokerStub("1000",held={"MSFT":"0.33333"})
         with patch.dict(sys.modules,modules):
             result=main.buy_signals(trader,[("AAPL",Decimal(99)),("MSFT",Decimal(95))],
                 fake_settings(dry_run=False),NOW.date().isoformat())
-        self.assertEqual(len(trader.sent),2)
+        self.assertEqual(len(trader.sent),1)
         self.assertEqual(trader.sent[0]["notional"],200.0)
-        self.assertEqual(trader.sent[1]["notional"],29.4)
-        self.assertEqual(trader.sent[1]["symbol"],"MSFT")
-        self.assertEqual(trader.sent[1]["side"],"buy")
-        self.assertEqual(result["submitted"][1][4],"ADD_HELD")
+        self.assertEqual(trader.sent[0]["symbol"],"AAPL")
+        self.assertIn(("MSFT","HELD_HANDLED_BY_LOWWATER"),result["skipped"])
 
     def test_remaining_margin_buying_power_reduced_for_sequential_new_entries(self):
         modules,_=stub_modules()
@@ -365,7 +377,8 @@ class BuyerTests(unittest.TestCase):
         trader=BrokerStub("0")
         trader.margin_power="10000"
         with patch.dict(sys.modules,{**stub_modules()[0],**modules}), patch("sys.argv",["main.py"]):
-            with patch.object(main,"settings_from_env",return_value=fake_settings()), patch.object(main,"clients",return_value=(SheetStub(good_rows()),trader)):
+            with patch.object(main,"settings_from_env",return_value=fake_settings()), patch.object(main,"clients",return_value=(SheetStub(good_rows()),trader)),patch.object(
+                main.lowwater_tracker,"connect",return_value=SimpleNamespace(close=lambda:None)):
                 main.main()
         self.assertTrue(scheduled["started"])
         self.assertEqual(trader.sent,[],"Scheduler startup must not send orders")
