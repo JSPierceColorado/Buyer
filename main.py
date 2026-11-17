@@ -372,6 +372,26 @@ def run_lowwater_sweep(trader,members:set[str],s:Settings,session:str)->dict:
     from alpaca.trading.requests import MarketOrderRequest
     positions=trader.get_all_positions()
     if positions is None:raise RuntimeError("LOWWATER_POSITIONS_UNVERIFIABLE")
+    if not positions:
+        # Soft double-check: a single empty broker result is not proof that
+        # all holdings vanished. A second empty result still requires a
+        # different trading session before the persistent ledger is cleared.
+        retry=trader.get_all_positions()
+        if retry is None:raise RuntimeError("LOWWATER_EMPTY_PORTFOLIO_RECHECK_FAILED")
+        if retry:
+            LOG.warning("LOWWATER_TRANSIENT_EMPTY_PORTFOLIO recovered_after_immediate_recheck=TRUE")
+            positions=retry
+        else:
+            ready=(lowwater_tracker.confirm_portfolio_snapshot(
+                session,empty=True,path=lowwater_tracker.DB_PATH)
+                if not s.dry_run else False)
+            if ready:
+                lowwater_tracker.drop_absent(set(),path=lowwater_tracker.DB_PATH,session=session)
+            LOG.warning("LOWWATER_PORTFOLIO_EMPTY_DOUBLECHECK empty_twice=TRUE retired=%s no_buys=TRUE",
+                        ready)
+            return {"sampled":0,"seeded":0,"submitted":0,"preview":0,
+                    "review_required":0,"skipped":0,
+                    "portfolio_empty":True,"records_retired":bool(ready)}
     active=set(); eligible={}
     for p in positions:
         info=lowwater_tracker.position_info(p)
@@ -383,6 +403,8 @@ def run_lowwater_sweep(trader,members:set[str],s:Settings,session:str)->dict:
             if SYMBOL_RE.fullmatch(sym) and sym in members:
                 active.add(sym)  # Invalid quote must not delete its episode.
     if not s.dry_run:
+        lowwater_tracker.confirm_portfolio_snapshot(
+            session,empty=False,path=lowwater_tracker.DB_PATH)
         lowwater_tracker.drop_absent(active,path=lowwater_tracker.DB_PATH,session=session)
     _,pending=held_and_pending(trader)
     stopped=stopped_this_week(trader,session)
@@ -450,6 +472,11 @@ def run_lowwater_sweep(trader,members:set[str],s:Settings,session:str)->dict:
         report["submitted"]+=1
         LOG.warning("LOWWATER_LIVE_ORDER_SUBMITTED symbol=%s step=%d/6 amount=%s cid=%s order_id=%s",
                     symbol,plan["step"],amount,plan["cid"],getattr(response,"id","ACK_PENDING"))
+    if not s.dry_run:
+        overview=lowwater_tracker.audit(path=lowwater_tracker.DB_PATH)
+        LOG.info("LOWWATER_DAILY_AUDIT tracked=%d step_counts=%s flagged=%s pending=%s",
+                 overview["tracked"],overview["step_counts"],
+                 overview["flagged"],overview["pending"])
     LOG.info("LOWWATER_CYCLE_COMPLETE report=%s",report)
     return report
 
