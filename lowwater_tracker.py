@@ -70,6 +70,10 @@ def connect(path=DB_PATH):
         episode TEXT NOT NULL, session TEXT NOT NULL, event TEXT NOT NULL,
         price TEXT NOT NULL, step INTEGER NOT NULL,
         amount TEXT NOT NULL, details TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS portfolio_health(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        last_empty_session TEXT NOT NULL,
+        consecutive_empty_sessions INTEGER NOT NULL)""")
     conn.commit()
     return conn
 
@@ -103,6 +107,53 @@ def order_reconciliation(order,row):
     if state not in TERMINAL:
         return ("UNKNOWN",filled)
     return ("FILLED" if filled>0 else "NO_FILL",filled)
+
+def confirm_portfolio_snapshot(session,*,empty,path=DB_PATH):
+    """A true empty portfolio must be confirmed on two distinct market days.
+
+    The buyer separately fetches the broker portfolio a second time whenever
+    it receives an empty list. This persistent guard prevents both empty
+    responses from erasing all low-water records on a single bad API day.
+    Returns True if records may be retired, or if portfolio is nonempty.
+    """
+    date.fromisoformat(session)
+    with closing(connect(path)) as conn,conn:
+        row=conn.execute("""SELECT last_empty_session,consecutive_empty_sessions
+            FROM portfolio_health WHERE id=1""").fetchone()
+        if not empty:
+            conn.execute("""INSERT OR REPLACE INTO portfolio_health
+                VALUES(1,'',0)""")
+            return True
+        last=row["last_empty_session"] if row else ""
+        count=int(row["consecutive_empty_sessions"]) if row else 0
+        if session!=last:
+            count=min(count+1,2)
+            conn.execute("""INSERT OR REPLACE INTO portfolio_health
+                VALUES(1,?,?)""",(session,count))
+        if count<2:
+            LOG.warning("LOWWATER_EMPTY_PORTFOLIO_RETAIN_HISTORY session=%s confirmed_days=%d next_check=NEXT_TRADING_DAY",
+                        session,count)
+            return False
+        LOG.warning("LOWWATER_EMPTY_PORTFOLIO_CONFIRMED session=%s confirmed_days=%d retiring_old_episodes=TRUE",
+                    session,count)
+        return True
+
+
+def audit(path=DB_PATH):
+    """Read-only summary for automated ladder reliability monitoring."""
+    with closing(connect(path)) as conn:
+        rows=conn.execute("SELECT symbol,steps,flag,pending_id,initial_notional "
+                          "FROM ladder ORDER BY symbol").fetchall()
+        bad=[(r["symbol"],r["flag"]) for r in rows if r["flag"]]
+        pending=[r["symbol"] for r in rows if r["pending_id"]]
+        count=[0]*7
+        for r in rows:
+            step=int(r["steps"])
+            if not 0<=step<=6:raise RuntimeError("LOWWATER_STEP_COUNT_OUT_OF_RANGE")
+            count[step]+=1
+        return {"tracked":len(rows),"step_counts":count,"flagged":bad,
+                "pending":pending}
+
 
 def drop_absent(current_symbols,*,path=DB_PATH,session):
     """Retire episodes when a validated complete portfolio no longer holds them."""
@@ -210,9 +261,15 @@ def observe(position,session,*,lookup,path=DB_PATH,readonly=False):
                     "new_low":new_low}
         step=old["steps"]+1
         basis=Decimal(old["initial_notional"])
-        amount=(basis*FRACTIONS[step-1]).quantize(CENT,rounding=ROUND_DOWN)
-        if amount<Decimal("1"):
+        raw=(basis*FRACTIONS[step-1]).quantize(CENT,rounding=ROUND_DOWN)
+        if basis<Decimal("1"):
             return {"status":"BELOW_MINIMUM_ORDER","next_step":step}
+        # Alpaca fractional-notional market buys require at least $1.
+        # Raise tiny ladder rungs to $1, never above the original basis.
+        amount=min(basis,max(Decimal("1.00"),raw))
+        if amount!=raw:
+            LOG.info("LOWWATER_MINIMUM_ORDER_FLOOR symbol=%s step=%d raw=%s notional=%s",
+                     sym,step,raw,amount)
         return {"status":"READY","symbol":sym,"episode":old["episode"],
                 "step":step,"amount":amount,"price":price,
                 "cid":safe_order_id(old["episode"],step,sym),

@@ -43,6 +43,53 @@ class LowWaterTests(unittest.TestCase):
         self.assertEqual(plan["status"],"READY")
         lw.reserve(plan,self.day.isoformat(),path=self.path)
         self.orders[plan["cid"]]=filled(plan["cid"])
+    def test_tiny_initial_position_scales_to_minimum_notional(self):
+        # $5 entry yields original raw rungs $0.25 and $0.50.
+        self.observe(pos("100",qty=".05"))
+        self.nextday()
+        first=self.observe(pos("99",qty=".05"))
+        self.assertEqual(first["status"],"READY")
+        self.assertEqual(first["initial_notional"],Decimal("5.00"))
+        self.assertEqual(first["amount"],Decimal("1.00"))
+        self.reserve_and_fill(first)
+        self.nextday()
+        second=self.observe(pos("98",qty=".06"))
+        self.assertEqual(second["status"],"READY")
+        self.assertEqual(second["step"],2)
+        self.assertEqual(second["amount"],Decimal("1.00"))
+        # Later steps retain their normal fractions; no single rung
+        # may exceed the initial $5 cost basis.
+        self.assertLessEqual(second["amount"],second["initial_notional"])
+
+    def test_portfolio_empty_needs_two_different_sessions(self):
+        self.observe(pos("100"))
+        monday="2026-11-09"
+        tuesday="2026-11-10"
+        self.assertFalse(lw.confirm_portfolio_snapshot(monday,empty=True,path=self.path))
+        self.assertFalse(lw.confirm_portfolio_snapshot(monday,empty=True,path=self.path))
+        self.assertIsNotNone(self.state())
+        self.assertTrue(lw.confirm_portfolio_snapshot(tuesday,empty=True,path=self.path))
+        lw.drop_absent(set(),path=self.path,session=tuesday)
+        self.assertIsNone(self.state())
+
+    def test_real_portfolio_resets_empty_counter(self):
+        self.observe(pos("100"))
+        self.assertFalse(lw.confirm_portfolio_snapshot("2026-11-09",empty=True,path=self.path))
+        self.assertTrue(lw.confirm_portfolio_snapshot("2026-11-10",empty=False,path=self.path))
+        self.assertFalse(lw.confirm_portfolio_snapshot("2026-11-11",empty=True,path=self.path))
+        self.assertIsNotNone(self.state())
+
+    def test_health_audit_summarizes_steps_and_pending_orders(self):
+        self.observe(pos("100"))
+        self.nextday()
+        plan=self.observe(pos("99"))
+        lw.reserve(plan,self.day.isoformat(),path=self.path)
+        audit=lw.audit(path=self.path)
+        self.assertEqual(audit["tracked"],1)
+        self.assertEqual(audit["step_counts"],[1,0,0,0,0,0,0])
+        self.assertEqual(audit["pending"],["AAPL"])
+        self.assertEqual(audit["flagged"],[])
+
     def test_first_observation_only_seeds_and_no_buy(self):
         p=pos("95")
         self.assertEqual(self.observe(p)["status"],"SEEDED")

@@ -143,6 +143,47 @@ class BuyerTests(unittest.TestCase):
         self.assertEqual(result["submitted"],0)
         self.assertEqual(broker.sent,[])
 
+    def test_transient_empty_portfolio_uses_immediate_recheck(self):
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        class Broker(BrokerStub):
+            def __init__(self):
+                super().__init__()
+                self.lookups=0
+            def get_all_positions(self):
+                self.lookups+=1
+                if self.lookups==1:return []
+                return [SimpleNamespace(symbol="AAPL",qty="1",
+                    asset_class="us_equity",side="long",avg_entry_price="100",
+                    current_price="98",unrealized_plpc="-.02")]
+        broker=Broker()
+        with TemporaryDirectory() as directory,patch.object(
+            main.lowwater_tracker,"DB_PATH",directory+"/guard.sqlite"),patch.dict(
+                sys.modules,stub_modules()[0]):
+            out=main.run_lowwater_sweep(broker,{"AAPL"},fake_settings(dry_run=False),"2026-11-09")
+        # Two reads confirm the transient empty response; the later order
+        # guard independently reads holdings once more.
+        self.assertEqual(broker.lookups,3)
+        self.assertEqual(out["seeded"],1)
+        self.assertFalse(out.get("portfolio_empty",False))
+
+    def test_double_empty_keeps_records_until_next_day(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+        broker=BrokerStub()
+        with TemporaryDirectory() as directory,patch.object(
+            main.lowwater_tracker,"DB_PATH",directory+"/guard.sqlite"),patch.dict(
+                sys.modules,stub_modules()[0]):
+            monday=main.run_lowwater_sweep(
+                broker,{"AAPL"},fake_settings(dry_run=False),"2026-11-09")
+            tuesday=main.run_lowwater_sweep(
+                broker,{"AAPL"},fake_settings(dry_run=False),"2026-11-10")
+        self.assertTrue(monday["portfolio_empty"])
+        self.assertFalse(monday["records_retired"])
+        self.assertTrue(tuesday["records_retired"])
+        self.assertEqual(broker.sent,[])
+
     def test_noon_and_dst(self):
         self.assertEqual(main.next_noon(datetime(2026,7,6,11,tzinfo=main.DENVER)).isoformat(),
                          "2026-07-06T12:00:00-06:00")
