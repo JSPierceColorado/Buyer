@@ -162,7 +162,9 @@ class BuyerTests(unittest.TestCase):
             main.lowwater_tracker,"DB_PATH",directory+"/guard.sqlite"),patch.dict(
                 sys.modules,stub_modules()[0]):
             out=main.run_lowwater_sweep(broker,{"AAPL"},fake_settings(dry_run=False),"2026-11-09")
-        self.assertEqual(broker.lookups,2)
+        # Two reads confirm the transient empty response; the later order
+        # guard independently reads holdings once more.
+        self.assertEqual(broker.lookups,3)
         self.assertEqual(out["seeded"],1)
         self.assertFalse(out.get("portfolio_empty",False))
 
