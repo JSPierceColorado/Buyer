@@ -14,7 +14,7 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Python compile check
-        run: python -m compileall -q main.py lowwater_tracker.py
+        run: python -m compileall -q main.py lowwater_tracker.py deposit_compounder.py
       - name: Verify margin reference and read-only startup invariants
         run: |
           grep -n 'available_buying_power(account)' main.py

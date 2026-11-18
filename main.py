@@ -20,6 +20,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
 
 import lowwater_tracker
+import deposit_compounder
 
 DENVER=ZoneInfo("America/Denver")
 NEW_YORK=ZoneInfo("America/New_York")
@@ -503,6 +504,25 @@ def clients(s:Settings):
     return sheets,trader
 
 
+def run_core_cycle(s:Settings,trader=None):
+    """Cash deposit watcher; uses existing V2 credentials and /data volume.
+
+    Never posts when DRY_RUN is enabled; historical CSD is baselined only.
+    This is independent of Screener score and the low-water strategy.
+    """
+    if trader is None:
+        from alpaca.trading.client import TradingClient
+        # The core watcher does not need Google Sheets. Do not let an
+        # unrelated Screener permission or outage block deposits.
+        trader=TradingClient(s.alpaca_key,s.alpaca_secret,paper=s.paper)
+    result=deposit_compounder.run(
+        trader,path=deposit_compounder.DB_PATH,dry_run=s.dry_run,
+        get_csd=lambda:deposit_compounder.fetch_csd(
+            s.alpaca_key,s.alpaca_secret,s.paper))
+    LOG.info("CORE_DEPOSIT_CYCLE_COMPLETE report=%s",result)
+    return result
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-now",action="store_true",
@@ -526,6 +546,16 @@ def main():
     database.close()
     LOG.info("LOWWATER_STORAGE_READY path=%s steps=6 observation_once_daily=TRUE",
              lowwater_tracker.DB_PATH)
+    try:
+        # The first successful run seeds the entire historical CSD list
+        # without buying; this is vital before any future deposit can trade.
+        report=run_core_cycle(s,preflight_trader)
+        LOG.info("CORE_DEPOSIT_PREFLIGHT_OK status=%s",report["status"])
+    except Exception as exc:
+        # The unrelated V2 noon buyer remains operational; core purchases
+        # will NOT happen until positive funding/ledger checks succeed.
+        LOG.error("CORE_DEPOSIT_PREFLIGHT_FAILED type=%s core_no_trades_until_verified=TRUE",
+                  type(exc).__name__)
     LOG.info("V2_BUYER_PREFLIGHT_OK buying_power_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
              preflight_power>0,len(preflight_held),len(preflight_pending),
              "PAPER" if s.paper else "LIVE")
@@ -541,6 +571,20 @@ def main():
             LOG.exception("DAILY_NOON_BUYER_FAILED")
     scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
         hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
+    def core_scheduled():
+        try:run_core_cycle(s)
+        except Exception as exc:
+            LOG.error("CORE_DEPOSIT_CYCLE_FAILED error_type=%s no_orders_on_uncertainty=TRUE",
+                      type(exc).__name__)
+    # Monitor during NY market hours, independent of Denver noon score buys.
+    # After-hours/weekend deposits await the next market session.
+    scheduler.add_job(core_scheduled,"cron",day_of_week="mon-fri",
+        hour="9-15",minute="5,15,25,35,45,55",timezone=NEW_YORK,
+        id="v2_cash_deposit_compounder",replace_existing=True,
+        max_instances=1,coalesce=True)
+    LOG.info("CORE_COMPOUNDER_STARTED schedule=every_10min_NY_market_hours "
+             "deposit_source=CSD investment=25pct_VT+25pct_SGOV "
+             "cash_only=TRUE margin_power_not_funding=TRUE protected_seller=VT,SGOV")
     LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
              "new_entry=2pct_margin_power sp100_lowwater_steps=5_10_20_40_80_100pct_original nonsp100_no_additions=TRUE weekly_stop_cooldown=MONDAY",
              "PAPER" if s.paper else "LIVE",s.dry_run)
