@@ -46,3 +46,23 @@ To verify credentials, run `python main.py --check-now`; this forces **dry run**
 ### Operational warning
 
 This is a live-capable automated BUYER. Market orders do not guarantee an execution price and can immediately lose value. It never sells, and no assumption is made that a separate seller bot is deployed. Use dedicated credentials and restrict Railway secrets to the necessary service. Confirm source-sheet quality, broker buying power and margin risk, order journal and execution logs before relying on automated trading.
+
+
+## Deposit-funded Core Compounder (VT / SGOV)
+
+The V2-Buyer Railway worker also owns a **separate persistent deposit watcher** running every 10 minutes during New York market hours (weekday 09:05–15:55 Eastern; actual buy orders only when the Alpaca market clock is open). The same account credentials and existing /data Railway persistent volume are reused; there is **no additional buyer service or second brokerage account**.
+
+**Source of funds:** read Alpaca Trading API \`CSD\` (positive cash-deposit activity) records with strict pagination, schema and stable-ID validation. The very first successful watcher run establishes a historical deposit baseline **without trading**. Deposits already in the account are not retroactively reallocated. Subsequent newly observed deposit IDs are persisted exactly once.
+
+**Allocation:** for each new credited cash deposit, reserve **25% of the original deposit for VT** and **25% for SGOV**, rounded down to cents. The other 50% remains outside the Core Compounder for the existing automated strategy. For a $1,000 deposit, this creates a $250 VT order and a $250 SGOV order, subject to available unborrowed cash. Each order is submitted no more than once per durable deterministic client order ID (\`v2core-...\`).
+
+**No-margin constraint:** require account \`cash\`, \`non_marginable_buying_power\`, and \`buying_power\` each to cover the order, accounting conservatively for pending outbound transfers. The buyer waits if another broker order is open, the market is closed, asset fractional eligibility cannot be verified, or a previous core order is unresolved. It never substitutes margin buying power for cash; no API transfer or borrowing action exists in this module. This is a **cash-check safeguard in a shared margin account**, not a legally segregated account: other bots may trade concurrently, margin financing and broker liquidation can still affect aggregate collateral.
+
+**Idempotency:** SQLite \`/data/v2-core.sqlite3\` holds account identity, original historical-deposit boundary, new deposit IDs, each ETF entitlement, pending/filled order IDs, fill reconciliation and audit events. Network-uncertain, canceled or unconfirmed orders stop further core buys until reviewed; never blindly retry. Contributions whose 25% per-ETF share is less than Alpaca's $1 minimum are recorded as deferred and not automatically aggregated into a later buy. A pre-existing externally acquired VT/SGOV position blocks initial tracking to avoid incorrect attribution.
+
+**No seller:** \`JSPierceColorado/alpaca-seller-bot\` independently excludes VT and SGOV from **all exits** (both loss and profit). Other sellers/broker-originated liquidations are beyond the scope of this safeguard. The AI Recommendations Buyer also excludes these two symbols from any regular research orders, keeping origin attribution clean. V2 score entries remain 2% of available margin buying power, and S&P100 low-water holdings retain six-step rebuy rules.
+
+**Daily audit:** \`CORE_DEPOSIT_CYCLE_COMPLETE\`, \`CORE_NEW_CASH_DEPOSIT\`, \`CORE_BUY_SUBMITTED\`, \`CORE_ORDER_FILLED\`, \`CORE_OUTSTANDING_ORDER_REVIEW\` and the other \`CORE_...\` logs expose contribution amounts and delayed actions. Read-only snapshot/performance reconciliation is separate; no orders or prices are considered fills until Alpaca confirms them.
+
+**Testing:** \`python -m unittest discover -s tests -v\` includes cash-only, duplicate-order, old-deposit, broker-timeout, stable-account-identity and scheduler checks.
+
