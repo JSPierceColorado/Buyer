@@ -349,6 +349,15 @@ def run(trader,*,get_csd,path=DB_PATH,dry_run=False,now=None):
             return {"status":"MARKET_CLOSED","new":count,
                     "reconciled":revised,"health":health(c),"orders":0}
         verify_positions(c,trader)
+        unresolved=c.execute("""SELECT cid,state FROM legs
+            WHERE state IN ('RESERVED','ORDER_PENDING','REVIEW')""").fetchall()
+        if unresolved:
+            # If one leg's POST or fill is unresolved, don't buy the other
+            # ETF or move on to another deposit. Preserve a balanced core.
+            LOG.warning("CORE_OUTSTANDING_ORDER_REVIEW count=%d no_new_orders=TRUE",
+                        len(unresolved))
+            return {"status":"RECONCILIATION_REQUIRED","new":count,
+                    "orders":0,"health":health(c)}
         # One OPEN order, even for another strategy, may consume cash. Wait.
         orders=trader.get_orders(filter=GetOrdersRequest(
             status=QueryOrderStatus.OPEN,limit=500,nested=True))
