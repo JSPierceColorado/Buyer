@@ -404,11 +404,11 @@ class BuyerTests(unittest.TestCase):
 
     def test_scheduler_noon_denver_without_railway_cron(self):
         from types import ModuleType
-        scheduled={}
+        scheduled={"jobs":{}}
         class Stub:
             def __init__(self,**kwargs):scheduled["init"]=kwargs
             def add_job(self,callback,kind,**kwargs):
-                scheduled["job"]=(callback,kind,kwargs)
+                scheduled["jobs"][kwargs["id"]]=(callback,kind,kwargs)
             def start(self):scheduled["started"]=True
         module=ModuleType("apscheduler.schedulers.blocking")
         module.BlockingScheduler=Stub
@@ -419,14 +419,20 @@ class BuyerTests(unittest.TestCase):
         trader.margin_power="10000"
         with patch.dict(sys.modules,{**stub_modules()[0],**modules}), patch("sys.argv",["main.py"]):
             with patch.object(main,"settings_from_env",return_value=fake_settings()), patch.object(main,"clients",return_value=(SheetStub(good_rows()),trader)),patch.object(
-                main.lowwater_tracker,"connect",return_value=SimpleNamespace(close=lambda:None)):
+                main.lowwater_tracker,"connect",return_value=SimpleNamespace(close=lambda:None)), patch.object(
+                 main,"run_core_cycle",return_value={"status":"BASELINED"}):
                 main.main()
         self.assertTrue(scheduled["started"])
         self.assertEqual(trader.sent,[],"Scheduler startup must not send orders")
         self.assertEqual(scheduled["init"]["timezone"],main.DENVER)
-        callback,kind,params=scheduled["job"]
+        callback,kind,params=scheduled["jobs"]["v2_noon_buyer"]
         self.assertEqual(kind,"cron")
         self.assertEqual((params["day_of_week"],params["hour"],params["minute"]),("mon-fri",12,0))
+        _,core_kind,core_params=scheduled["jobs"]["v2_cash_deposit_compounder"]
+        self.assertEqual(core_kind,"cron")
+        self.assertEqual(core_params["timezone"],main.NEW_YORK)
+        self.assertEqual(core_params["hour"],"9-15")
+        self.assertEqual(core_params["minute"],"5,15,25,35,45,55")
 
 
 if __name__=="__main__":
