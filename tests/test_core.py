@@ -144,7 +144,7 @@ class CoreTests(unittest.TestCase):
             self.run_cycle()
         self.trader.fail_post=False
         out=self.run_cycle()
-        self.assertEqual(out["status"],"NO_ACTION")
+        self.assertEqual(out["status"],"RECONCILIATION_REQUIRED")
         self.assertEqual(len(self.trader.sent),0)
         with core.connect(self.path) as c:
             r=c.execute("SELECT state FROM legs WHERE symbol='VT'").fetchone()
