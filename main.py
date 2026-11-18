@@ -511,7 +511,10 @@ def run_core_cycle(s:Settings,trader=None):
     This is independent of Screener score and the low-water strategy.
     """
     if trader is None:
-        _,trader=clients(s)
+        from alpaca.trading.client import TradingClient
+        # The core watcher does not need Google Sheets. Do not let an
+        # unrelated Screener permission or outage block deposits.
+        trader=TradingClient(s.alpaca_key,s.alpaca_secret,paper=s.paper)
     result=deposit_compounder.run(
         trader,path=deposit_compounder.DB_PATH,dry_run=s.dry_run,
         get_csd=lambda:deposit_compounder.fetch_csd(
