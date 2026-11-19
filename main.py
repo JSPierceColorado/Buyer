@@ -1,11 +1,10 @@
-"""V2 live/paper BUYER: 12:00 America/Denver every NYSE trading weekday.
+"""Simple V2 S&P 100 momentum buyer, running at noon America/Denver.
 
-Reads original V2 Screener!G, requiring a same-day verified 9AM scan marker.
-For each score >=95: buy 2% of remaining margin buying power if unheld.
-S&P100 held positions use a persistent six-step once-daily low-water ladder:
-5/10/20/40/80/100% of original basis on >=1% successive observed new lows.
-No held additions for non-S&P100; filled stops block buys until next Monday.
-One deterministic broker order ID per symbol/day; no blind submission retries.
+Reads the original V2 Screener score (column G) after a verified same-day scan.
+For each score >=95, opens an unheld US-equity position using 2% of remaining
+Alpaca buying_power (including margin). Does not add to existing positions,
+average down, purchase deposit-funded ETFs, or set stop losses.
+Deterministic broker order IDs guard against duplicate submissions.
 """
 from __future__ import annotations
 
@@ -18,9 +17,6 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone, date, time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from zoneinfo import ZoneInfo
-
-import lowwater_tracker
-import deposit_compounder
 
 DENVER=ZoneInfo("America/Denver")
 NEW_YORK=ZoneInfo("America/New_York")
@@ -42,7 +38,6 @@ class Settings:
     dry_run:bool
     threshold:Decimal
     fraction:Decimal
-    addition:Decimal
 
 
 def flag(name:str,default:bool)->bool:
@@ -73,8 +68,7 @@ def settings_from_env()->Settings:
         paper=flag("ALPACA_PAPER",True),
         dry_run=flag("DRY_RUN",True),
         threshold=money(os.getenv("MINIMUM_SCORE","95")),
-        fraction=money(os.getenv("BUY_FRACTION","0.02")),
-        addition=Decimal("0")  # Legacy settings field, no longer used for held additions.
+        fraction=money(os.getenv("BUY_FRACTION","0.02"))
     )
     if not all((s.alpaca_key,s.alpaca_secret,s.google_credentials_json,s.sheet_id)):
         raise ValueError("Missing broker or Sheet credentials")
@@ -252,44 +246,9 @@ def available_buying_power(account)->Decimal:
     return money(getattr(account,"buying_power",None))
 
 
-def buying_power_order_amount(remaining:Decimal,fraction:Decimal,held:bool)->Decimal:
-    if held:
-        return Decimal(0)  # Additions need fresh validated broker price and entry basis.
+def buying_power_order_amount(remaining:Decimal,fraction:Decimal)->Decimal:
     amount=(remaining*fraction).quantize(CENT,rounding=ROUND_DOWN)
     return amount if amount>=MIN_ORDER else Decimal(0)
-
-
-def stopped_this_week(trader,day:str)->set[str]:
-    """Only filled V2 stop sells; Monday ET begins a fresh eligible week.
-
-    No local state sharing or inferred reasons: v2sl is the stop-only ID.
-    Any incomplete order-history response fails closed rather than re-buying.
-    """
-    from alpaca.trading.enums import QueryOrderStatus,OrderSide
-    from alpaca.trading.requests import GetOrdersRequest
-    current_day=date.fromisoformat(day)
-    monday=current_day-timedelta(days=current_day.weekday())
-    start=datetime.combine(monday,time.min,tzinfo=NEW_YORK)
-    orders=trader.get_orders(filter=GetOrdersRequest(
-        status=QueryOrderStatus.ALL,limit=500,after=start,
-        side=OrderSide.SELL,nested=False))
-    if orders is None or len(orders)>=500:
-        raise RuntimeError("WEEKLY_STOP_ORDER_HISTORY_UNVERIFIABLE")
-    stopped=set()
-    for order in orders:
-        cid=str(getattr(order,"client_order_id","") or "").lower()
-        if not re.fullmatch(r"v2sl-\d{8}-[a-z0-9-]+",cid):
-            continue
-        filled=Decimal(str(getattr(order,"filled_qty",None)))
-        if not filled.is_finite() or filled<0:
-            raise RuntimeError("WEEKLY_STOP_FILL_QUANTITY_INVALID")
-        if filled==0:
-            continue
-        submitted=getattr(order,"submitted_at",None)
-        if submitted is None or submitted.tzinfo is None or submitted<start:
-            raise RuntimeError("WEEKLY_STOP_ORDER_DATE_UNVERIFIABLE")
-        stopped.add(normalize_symbol(order.symbol))
-    return stopped
 
 
 def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dict:
@@ -300,19 +259,12 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
     account=trader.get_account()
     remaining=available_buying_power(account)
     _,pending=held_and_pending(trader)
-    stopped=stopped_this_week(trader,day)
-    if stopped:
-        LOG.info("WEEKLY_STOP_COOLDOWN blocked=%s week_start_ny=%s",
-                 sorted(stopped),day)
     for symbol,score in signals:
         if not trader.get_clock().is_open:
             LOG.warning("MARKET_CLOSED_DURING_CYCLE; stopping")
             break
         # Every symbol must pass fresh broker checks, not assumptions from a sheet.
         held,current_pending=held_and_pending(trader)
-        if symbol in stopped:
-            results["skipped"].append((symbol,"STOPPED_THIS_WEEK"))
-            continue
         if symbol in pending or symbol in current_pending:
             results["skipped"].append((symbol,"OPEN_ORDER"))
             continue
@@ -335,9 +287,9 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
             results["skipped"].append((symbol,"BUY_ORDER_ALREADY_ATTEMPTED_TODAY"))
             continue
         if symbol in held and held[symbol]>0:
-            results["skipped"].append((symbol,"HELD_HANDLED_BY_LOWWATER"))
+            results["skipped"].append((symbol,"ALREADY_HELD"))
             continue
-        amount=buying_power_order_amount(remaining,s.fraction,False)
+        amount=buying_power_order_amount(remaining,s.fraction)
         if amount<MIN_ORDER:
             results["skipped"].append((symbol,"INSUFFICIENT_BUYING_POWER_FOR_RULE"))
             continue
@@ -367,129 +319,13 @@ def buy_signals(trader,signals:list[tuple[str,Decimal]],s:Settings,day:str)->dic
 
 
 
-def run_lowwater_sweep(trader,members:set[str],s:Settings,session:str)->dict:
-    """Daily low-water samples and S&P100-only held additions; no score gate."""
-    from alpaca.trading.enums import OrderSide,TimeInForce
-    from alpaca.trading.requests import MarketOrderRequest
-    positions=trader.get_all_positions()
-    if positions is None:raise RuntimeError("LOWWATER_POSITIONS_UNVERIFIABLE")
-    if not positions:
-        # Soft double-check: a single empty broker result is not proof that
-        # all holdings vanished. A second empty result still requires a
-        # different trading session before the persistent ledger is cleared.
-        retry=trader.get_all_positions()
-        if retry is None:raise RuntimeError("LOWWATER_EMPTY_PORTFOLIO_RECHECK_FAILED")
-        if retry:
-            LOG.warning("LOWWATER_TRANSIENT_EMPTY_PORTFOLIO recovered_after_immediate_recheck=TRUE")
-            positions=retry
-        else:
-            ready=(lowwater_tracker.confirm_portfolio_snapshot(
-                session,empty=True,path=lowwater_tracker.DB_PATH)
-                if not s.dry_run else False)
-            if ready:
-                lowwater_tracker.drop_absent(set(),path=lowwater_tracker.DB_PATH,session=session)
-            LOG.warning("LOWWATER_PORTFOLIO_EMPTY_DOUBLECHECK empty_twice=TRUE retired=%s no_buys=TRUE",
-                        ready)
-            return {"sampled":0,"seeded":0,"submitted":0,"preview":0,
-                    "review_required":0,"skipped":0,
-                    "portfolio_empty":True,"records_retired":bool(ready)}
-    active=set(); eligible={}
-    for p in positions:
-        info=lowwater_tracker.position_info(p)
-        if info:
-            active.add(info["symbol"])
-            if info["symbol"] in members:eligible[info["symbol"]]=p
-        else:
-            sym=str(getattr(p,"symbol","") or "").upper()
-            if SYMBOL_RE.fullmatch(sym) and sym in members:
-                active.add(sym)  # Invalid quote must not delete its episode.
-    if not s.dry_run:
-        lowwater_tracker.confirm_portfolio_snapshot(
-            session,empty=False,path=lowwater_tracker.DB_PATH)
-        lowwater_tracker.drop_absent(active,path=lowwater_tracker.DB_PATH,session=session)
-    _,pending=held_and_pending(trader)
-    stopped=stopped_this_week(trader,session)
-    report={"sampled":0,"seeded":0,"submitted":0,"preview":0,"review_required":0,"skipped":0}
-    def lookup(cid):
-        from alpaca.common.exceptions import APIError
-        try:return trader.get_order_by_client_id(cid)
-        except APIError as exc:
-            if str(getattr(exc,"status_code",""))=="404":return None
-            raise
-    for symbol in sorted(eligible):
-        position=eligible[symbol]
-        report["sampled"]+=1
-        plan=lowwater_tracker.observe(position,session,lookup=lookup,
-                path=lowwater_tracker.DB_PATH,readonly=s.dry_run)
-        status=plan["status"]
-        if status=="SEEDED":
-            report["seeded"]+=1
-            continue
-        if status=="REVIEW_REQUIRED":
-            report["review_required"]+=1
-            LOG.warning("LOWWATER_REVIEW_REQUIRED symbol=%s reason=%s",
-                        symbol,plan.get("reason"))
-            continue
-        if status!="READY":
-            report["skipped"]+=1
-            continue
-        if symbol in stopped or symbol in pending:
-            LOG.info("LOWWATER_SKIP_ORDER_GUARD symbol=%s stopped=%s pending=%s",
-                     symbol,symbol in stopped,symbol in pending)
-            report["skipped"]+=1
-            continue
-        amount=plan["amount"]
-        if available_buying_power(trader.get_account())<amount or not trader.get_clock().is_open:
-            report["skipped"]+=1
-            continue
-        fresh=lowwater_tracker.position_info(trader.get_open_position(symbol))
-        initial=lowwater_tracker.position_info(position)
-        if (fresh is None or initial is None or fresh["symbol"]!=symbol or
-            fresh["price"]>plan["price"] or fresh["qty"]!=initial["qty"]):
-            LOG.info("LOWWATER_SKIP_QUOTE_MOVED symbol=%s",symbol)
-            report["skipped"]+=1
-            continue
-        _,pending_now=held_and_pending(trader)
-        if symbol in pending_now:
-            report["skipped"]+=1
-            continue
-        if order_already_attempted(trader,plan["cid"]):
-            LOG.warning("LOWWATER_EXISTING_ORDER_REVIEW symbol=%s",symbol)
-            report["review_required"]+=1
-            continue
-        if s.dry_run:
-            report["preview"]+=1
-            continue
-        lowwater_tracker.reserve(plan,session,path=lowwater_tracker.DB_PATH)
-        request=MarketOrderRequest(symbol=symbol,notional=float(amount),
-                    side=OrderSide.BUY,time_in_force=TimeInForce.DAY,
-                    client_order_id=plan["cid"])
-        try:
-            response=trader.submit_order(order_data=request)
-        except Exception:
-            LOG.error("LOWWATER_ORDER_UNCERTAIN symbol=%s cid=%s",
-                      symbol,plan["cid"])
-            raise RuntimeError("LOWWATER_ORDER_STATUS_UNCERTAIN_NO_RETRY") from None
-        report["submitted"]+=1
-        LOG.warning("LOWWATER_LIVE_ORDER_SUBMITTED symbol=%s step=%d/6 amount=%s cid=%s order_id=%s",
-                    symbol,plan["step"],amount,plan["cid"],getattr(response,"id","ACK_PENDING"))
-    if not s.dry_run:
-        overview=lowwater_tracker.audit(path=lowwater_tracker.DB_PATH)
-        LOG.info("LOWWATER_DAILY_AUDIT tracked=%d step_counts=%s flagged=%s pending=%s",
-                 overview["tracked"],overview["step_counts"],
-                 overview["flagged"],overview["pending"])
-    LOG.info("LOWWATER_CYCLE_COMPLETE report=%s",report)
-    return report
-
-
 def run_cycle(sheets,trader,s:Settings,now:datetime)->dict:
     if now.astimezone(DENVER).weekday()>=5 or not trader.get_clock().is_open:
         return {"status":"MARKET_CLOSED"}
-    signals,members=verified_screener_snapshot(sheets,s,now)
+    signals,_=verified_screener_snapshot(sheets,s,now)
     session=now.astimezone(NEW_YORK).date().isoformat()
-    low=run_lowwater_sweep(trader,members,s,session)
     new=buy_signals(trader,signals,s,session)
-    return {"status":"OK","lowwater":low,"new_entries":new}
+    return {"status":"OK","new_entries":new}
 
 
 def clients(s:Settings):
@@ -502,25 +338,6 @@ def clients(s:Settings):
     sheets=build("sheets","v4",credentials=credentials,cache_discovery=False)
     trader=TradingClient(s.alpaca_key,s.alpaca_secret,paper=s.paper)
     return sheets,trader
-
-
-def run_core_cycle(s:Settings,trader=None):
-    """Cash deposit watcher; uses existing V2 credentials and /data volume.
-
-    Never posts when DRY_RUN is enabled; historical CSD is baselined only.
-    This is independent of Screener score and the low-water strategy.
-    """
-    if trader is None:
-        from alpaca.trading.client import TradingClient
-        # The core watcher does not need Google Sheets. Do not let an
-        # unrelated Screener permission or outage block deposits.
-        trader=TradingClient(s.alpaca_key,s.alpaca_secret,paper=s.paper)
-    result=deposit_compounder.run(
-        trader,path=deposit_compounder.DB_PATH,dry_run=s.dry_run,
-        get_csd=lambda:deposit_compounder.fetch_csd(
-            s.alpaca_key,s.alpaca_secret,s.paper))
-    LOG.info("CORE_DEPOSIT_CYCLE_COMPLETE report=%s",result)
-    return result
 
 
 def main():
@@ -542,20 +359,6 @@ def main():
     _,preflight_trader=clients(s)
     preflight_power=available_buying_power(preflight_trader.get_account())
     preflight_held,preflight_pending=held_and_pending(preflight_trader)
-    database=lowwater_tracker.connect()
-    database.close()
-    LOG.info("LOWWATER_STORAGE_READY path=%s steps=6 observation_once_daily=TRUE",
-             lowwater_tracker.DB_PATH)
-    try:
-        # The first successful run seeds the entire historical CSD list
-        # without buying; this is vital before any future deposit can trade.
-        report=run_core_cycle(s,preflight_trader)
-        LOG.info("CORE_DEPOSIT_PREFLIGHT_OK status=%s",report["status"])
-    except Exception as exc:
-        # The unrelated V2 noon buyer remains operational; core purchases
-        # will NOT happen until positive funding/ledger checks succeed.
-        LOG.error("CORE_DEPOSIT_PREFLIGHT_FAILED type=%s core_no_trades_until_verified=TRUE",
-                  type(exc).__name__)
     LOG.info("V2_BUYER_PREFLIGHT_OK buying_power_positive=%s held_equities=%d pending_equity_orders=%d mode=%s",
              preflight_power>0,len(preflight_held),len(preflight_pending),
              "PAPER" if s.paper else "LIVE")
@@ -571,23 +374,10 @@ def main():
             LOG.exception("DAILY_NOON_BUYER_FAILED")
     scheduler.add_job(scheduled,"cron",day_of_week="mon-fri",
         hour=12,minute=0,id="v2_noon_buyer",replace_existing=True)
-    def core_scheduled():
-        try:run_core_cycle(s)
-        except Exception as exc:
-            LOG.error("CORE_DEPOSIT_CYCLE_FAILED error_type=%s no_orders_on_uncertainty=TRUE",
-                      type(exc).__name__)
-    # Monitor during NY market hours, independent of Denver noon score buys.
-    # After-hours/weekend deposits await the next market session.
-    scheduler.add_job(core_scheduled,"cron",day_of_week="mon-fri",
-        hour="9-15",minute="5,15,25,35,45,55",timezone=NEW_YORK,
-        id="v2_cash_deposit_compounder",replace_existing=True,
-        max_instances=1,coalesce=True)
-    LOG.info("CORE_COMPOUNDER_STARTED schedule=every_10min_NY_market_hours "
-             "deposit_source=CSD investment=25pct_VT+25pct_SGOV "
-             "cash_only=TRUE margin_power_not_funding=TRUE protected_seller=VT,SGOV")
-    LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver mode=%s dry_run=%s "
-             "new_entry=2pct_margin_power sp100_lowwater_steps=5_10_20_40_80_100pct_original nonsp100_no_additions=TRUE weekly_stop_cooldown=MONDAY",
-             "PAPER" if s.paper else "LIVE",s.dry_run)
+    LOG.info("V2_BUYER_STARTED schedule=12:00 America/Denver "
+             "score_min=%s buy_fraction=%s base=Alpaca_margin_buying_power "
+             "held_additions=DISABLED deposit_trading=DISABLED mode=%s dry_run=%s",
+             s.threshold,s.fraction,"PAPER" if s.paper else "LIVE",s.dry_run)
     scheduler.start()
 
 
